@@ -5,13 +5,10 @@ import torch
 import numpy as np
 from copy import deepcopy
 from ..utils.normalizer import LinearNormalizer, NormMode
-from fastwam.utils.pytorch_utils import dict_apply
-from fastwam.utils.logging_config import get_logger
-from .base_processor import BaseProcessor
+from fastwam_flash.utils.pytorch_utils import dict_apply
 
-logger = get_logger(__name__)
 
-class FastWAMProcessor(BaseProcessor):
+class BaseProcessor(ABC):
     def __init__(
         self,
         # keys
@@ -35,11 +32,10 @@ class FastWAMProcessor(BaseProcessor):
         val_transforms: Dict[str, List[Any]] | None, 
 
         # instruction transform
-        drop_high_level_prob: float = 1.0,
-        use_zh_instruction: bool = False,
+        drop_high_level_prob: float,
+        use_zh_instruction: bool,
 
-        tokenizer: Optional[Any] = None,
-        delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
+        tokenizer: Any
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
@@ -66,27 +62,6 @@ class FastWAMProcessor(BaseProcessor):
         self._normalizer = None
 
         self.tokenizer = tokenizer
-        if delta_action_dim_mask is None:
-            self.delta_action_dim_mask = None
-        else:
-            action_meta = self.shape_meta["action"]
-            expected_keys = [m["key"] for m in action_meta]
-            provided_keys = list(delta_action_dim_mask.keys())
-            if set(provided_keys) != set(expected_keys):
-                raise ValueError(
-                    f"`delta_action_dim_mask` keys mismatch. Expected {expected_keys}, got {provided_keys}."
-                )
-
-            self.delta_action_dim_mask = {}
-            for meta in action_meta:
-                key = meta["key"]
-                expected_dim = meta["shape"]
-                mask = delta_action_dim_mask[key]
-                if len(mask) != expected_dim:
-                    raise ValueError(
-                        f"`delta_action_dim_mask[{key}]` length must be {expected_dim}, got {len(mask)}."
-                    )
-                self.delta_action_dim_mask[key] = torch.as_tensor(mask, dtype=torch.bool)
 
     @property
     def is_train(self):
@@ -140,7 +115,7 @@ class FastWAMProcessor(BaseProcessor):
             low_level_instruction = zh if self.use_zh_instruction else eng
 
         if np.random.rand() < self.drop_high_level_prob:
-            instruction = f"{low_level_instruction}"
+            instruction = f"[Low]: {low_level_instruction}"
         else: 
             instruction = f"[High]: {high_level_instruction}, [Low]: {low_level_instruction}"
         
@@ -158,7 +133,7 @@ class FastWAMProcessor(BaseProcessor):
             k, meta_shape = meta["key"], meta["raw_shape"]
             actual_shape = batch["state"][k].shape[-1]
             assert actual_shape == meta_shape, \
-                f"State key {k} actual raw shape {actual_shape} mismatch with meta raw shape {meta_shape}."
+                f"State key {k} actual raw shape {actual_shape} mismatch with meta raw shape{meta_shape}."
         
         if self.action_state_transforms is not None: 
             for trans in self.action_state_transforms:
@@ -220,8 +195,7 @@ class FastWAMProcessor(BaseProcessor):
             
             # Apply transforms efficiently on the merged batch
             transforms = self.train_transforms if self.is_train else self.val_transforms
-            current_transforms = transforms[key] if isinstance(transforms, dict) else transforms
-            for trans in current_transforms:
+            for trans in transforms[key]:
                 image = trans(image)
             
             meta_shape = [self.num_obs_steps] + shape
@@ -229,16 +203,12 @@ class FastWAMProcessor(BaseProcessor):
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
             processed_images.append(image)
-        pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
         
+        pixel_values = torch.cat(processed_images, dim=0) # [num_input_cameras, C, H, W]
         if self.num_output_cameras > pixel_values.shape[0]:
             out = torch.zeros((self.num_output_cameras,) + pixel_values.shape[1:], device=pixel_values.device, dtype=pixel_values.dtype)
             out[0: pixel_values.shape[0]] = pixel_values
             sample["pixel_values"] = out
-        elif self.num_output_cameras < pixel_values.shape[0]:
-            logger.warning(f"num_output_cameras {self.num_output_cameras} is less than the number of cameras in data {pixel_values.shape[0]}, "
-                           f"truncating the input to the first {self.num_output_cameras} cameras.")
-            sample["pixel_values"] = pixel_values[:self.num_output_cameras]
         else:
             sample["pixel_values"] = pixel_values
 
@@ -248,15 +218,6 @@ class FastWAMProcessor(BaseProcessor):
             sample["gt_action"] = deepcopy(data["action"])
 
         # 3. action & state
-        if "action" in data and self.delta_action_dim_mask is not None:
-            action_is_pad = torch.as_tensor(data["action_is_pad"], dtype=torch.bool)
-            if bool(action_is_pad.any().item()):
-                for key, dim_mask in self.delta_action_dim_mask.items():
-                    cur_action = data["action"][key]
-                    cur_action_is_pad = action_is_pad.to(device=cur_action.device)
-                    cur_dim_mask = dim_mask.to(device=cur_action.device)
-                    pad_delta_mask = cur_action_is_pad.unsqueeze(1) & cur_dim_mask.unsqueeze(0)
-                    cur_action[pad_delta_mask] = 0.0
         data = self.action_state_transform(data)
         data = self.normalizer.forward(data)
         data = self.action_state_merger.forward(data)
@@ -266,8 +227,6 @@ class FastWAMProcessor(BaseProcessor):
             sample["action_is_pad"] = data["action_is_pad"] # [action_horizon,]
             sample["action_dim_is_pad"] = data["action_dim_is_pad"] # [action_dim,]
             assert sample["action"].shape[-1] == self.action_output_dim
-            # sample["action"][sample["action_is_pad"], :-1] = 0.0 # NOTE: we assume use delta_eef_pose + gripper， so pad action is 0
-
         
         # TODO: rename all "state" into "proprio"
         sample["proprio"] = data["state"] # [num_obs_steps, proprio_dim]
@@ -277,7 +236,7 @@ class FastWAMProcessor(BaseProcessor):
 
         sample["idx"] = data["idx"]
 
-        # sample = self.tokenizer(sample)
+        sample = self.tokenizer(sample)
         
         return sample
 

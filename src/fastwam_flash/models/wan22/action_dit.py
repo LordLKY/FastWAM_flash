@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Any, Dict, Optional
 
-from fastwam.utils.logging_config import get_logger
+from fastwam_flash.utils.logging_config import get_logger
 
 from .helpers.gradient import gradient_checkpoint_forward
 from .wan_video_dit import (

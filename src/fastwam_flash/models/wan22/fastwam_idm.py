@@ -3,7 +3,7 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from fastwam.utils.logging_config import get_logger
+from fastwam_flash.utils.logging_config import get_logger
 
 from .fastwam_joint import FastWAMJoint
 

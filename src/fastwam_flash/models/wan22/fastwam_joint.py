@@ -2,7 +2,7 @@ from typing import Any, Optional
 
 import torch
 
-from fastwam.utils.logging_config import get_logger
+from fastwam_flash.utils.logging_config import get_logger
 
 from .fastwam import FastWAM
 

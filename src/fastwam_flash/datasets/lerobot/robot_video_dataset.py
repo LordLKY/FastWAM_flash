@@ -14,8 +14,8 @@ from hydra.utils import instantiate
 from .base_lerobot_dataset import BaseLerobotDataset
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
-from fastwam.utils.logging_config import get_logger
-from fastwam.utils import misc, pytorch_utils
+from fastwam_flash.utils.logging_config import get_logger
+from fastwam_flash.utils import misc, pytorch_utils
 from accelerate import PartialState
 logger = get_logger(__name__)
 

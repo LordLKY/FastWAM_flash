@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from fastwam.utils.logging_config import get_logger
+from fastwam_flash.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
