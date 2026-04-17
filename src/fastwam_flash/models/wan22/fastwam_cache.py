@@ -567,6 +567,7 @@ class FastWAMCache(FastWAM):
                     for threshold, countdown in zip(thresholds, countdowns):
                         if sim > threshold:
                             skip_countdown = countdown
+                            break
             
             else:
                 pred_action = prev_predictions[-1][1]

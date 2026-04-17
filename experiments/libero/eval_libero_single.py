@@ -455,13 +455,17 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
+) -> tuple[bool, list, list[dict[str, Any]], Optional[float], list]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
+
+    # record actions (optional)
+    record_actions = bool(cfg.EVALUATION.get("record_actions", False))
+    action_array = []
 
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -515,6 +519,9 @@ def run_single_episode(
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
             replay_images.append(imgs.copy())
+
+            if record_actions:
+                action_array += pending_actions
         else:
             imgs = get_libero_image(obs)
             replay_images.append(imgs.copy())
@@ -578,7 +585,7 @@ def run_single_episode(
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr
+    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_array
 
 
 def run_single_task(
@@ -606,9 +613,13 @@ def run_single_task(
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
+    
+    # record actions (optional)
+    record_actions = bool(cfg.EVALUATION.get("record_actions", False))
+    action_records = {}
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
+        success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_array = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -667,11 +678,14 @@ def run_single_task(
                     success=success,
                     task_description=task_description,
                 )
+        if record_actions:
+            action_records[f"trial_{trial_idx}"] = action_array
 
     if visualize_future_video:
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
+    results["action_records"] = action_records
     return results
 
 
@@ -736,6 +750,13 @@ def eval_single_process(cfg: DictConfig):
     task = task_suite.get_task(cfg.EVALUATION.task_id)
     initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
 
+    # record actions (optional)
+    record_actions = bool(cfg.EVALUATION.get("record_actions", False))
+    action_records_dir = None
+    if record_actions:
+        action_records_dir = Path(cfg.EVALUATION.output_dir) / "action_records" / cfg.EVALUATION.task_suite_name
+        action_records_dir.mkdir(parents=True, exist_ok=True)
+
     while len(initial_states) < int(cfg.EVALUATION.num_trials):
         initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
 
@@ -772,7 +793,19 @@ def eval_single_process(cfg: DictConfig):
     output_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_results.json"
-
+    
+    # record actions (optional)
+    if record_actions:
+        action_records = results["action_records"]
+        # Save action records as npz file
+        npz_filename = f"task{cfg.EVALUATION.task_id}_actions.npz"
+        npz_path = action_records_dir / npz_filename
+        # Convert action records to numpy arrays
+        np_action_records = {str(trial_idx): np.array(actions) for trial_idx, actions in action_records.items()}
+        np.savez(str(npz_path), **np_action_records)
+        print(f"Saved action records to {npz_path}")
+    
+    del results["action_records"]
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, cls=NumpyEncoder)
 

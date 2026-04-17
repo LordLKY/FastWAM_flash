@@ -36,6 +36,8 @@ EVALUATION:
   rand_device: cpu
   tiled: false
 
+  record_actions: false
+
   # Optional external inputs
   dataset_stats_path: null
   device: cuda

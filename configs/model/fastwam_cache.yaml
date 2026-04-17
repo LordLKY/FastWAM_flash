@@ -58,7 +58,7 @@ loss:
   lambda_action: 1.0
 
 dit_cache_config:
-  cache_type: "blockcache"
+  cache_type: "none"
   teacache_config:
     step_start: 1
     step_end: 10
@@ -71,8 +71,8 @@ dit_cache_config:
       - -0.038073982
   dreamzero_config:
     thresholds:
-      - 0.95
-      - 0.93
+      - 0.9
+      - 0.8
     countdowns:
       - 4
       - 2
