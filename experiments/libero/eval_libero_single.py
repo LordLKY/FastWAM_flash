@@ -455,7 +455,7 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float], list]:
+) -> tuple[bool, list, list[dict[str, Any]], Optional[float], list, list]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
@@ -465,7 +465,10 @@ def run_single_episode(
 
     # record actions (optional)
     record_actions = bool(cfg.EVALUATION.get("record_actions", False))
+    record_actions_bias = bool(cfg.EVALUATION.get("record_actions_bias", False))
     action_array = []
+    action_bias_array = []
+    prev_extra_actions = []
 
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -518,6 +521,16 @@ def run_single_episode(
                 pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
+
+                # for action bias
+                if record_actions_bias:
+                    if prev_extra_actions is not None:
+                        action_bias = [[a - b for a, b in zip(i, j)] for i, j in zip(pending_actions, prev_extra_actions)]
+                        action_bias_array += action_bias
+                    assert 2 * replan_steps <= action_chunk.shape[0], (
+                        f"Action chunk size {action_chunk.shape[0]} is not enough to predict {replan_steps} steps."
+                    )
+                    prev_extra_actions = action_chunk[replan_steps:2 * replan_steps].tolist()
             replay_images.append(imgs.copy())
 
             if record_actions:
@@ -585,7 +598,7 @@ def run_single_episode(
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_array
+    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_array, action_bias_array
 
 
 def run_single_task(
@@ -616,10 +629,12 @@ def run_single_task(
     
     # record actions (optional)
     record_actions = bool(cfg.EVALUATION.get("record_actions", False))
+    record_actions_bias = bool(cfg.EVALUATION.get("record_actions_bias", False))
     action_records = {}
+    action_bias_records = {}
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_array = run_single_episode(
+        success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_array, action_bias_array = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -680,12 +695,15 @@ def run_single_task(
                 )
         if record_actions:
             action_records[f"trial_{trial_idx}"] = action_array
+        if record_actions_bias:
+            action_bias_records[f"trial_{trial_idx}"] = action_bias_array
 
     if visualize_future_video:
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
     results["action_records"] = action_records
+    results["action_bias_records"] = action_bias_records
     return results
 
 
@@ -756,6 +774,11 @@ def eval_single_process(cfg: DictConfig):
     if record_actions:
         action_records_dir = Path(cfg.EVALUATION.output_dir) / "action_records" / cfg.EVALUATION.task_suite_name
         action_records_dir.mkdir(parents=True, exist_ok=True)
+    record_actions_bias = bool(cfg.EVALUATION.get("record_actions_bias", False))
+    action_bias_records_dir = None
+    if record_actions_bias:
+        action_bias_records_dir = Path(cfg.EVALUATION.output_dir) / "action_bias_records" / cfg.EVALUATION.task_suite_name
+        action_bias_records_dir.mkdir(parents=True, exist_ok=True)
 
     while len(initial_states) < int(cfg.EVALUATION.num_trials):
         initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
@@ -804,8 +827,18 @@ def eval_single_process(cfg: DictConfig):
         np_action_records = {str(trial_idx): np.array(actions) for trial_idx, actions in action_records.items()}
         np.savez(str(npz_path), **np_action_records)
         print(f"Saved action records to {npz_path}")
+    if record_actions_bias:
+        action_bias_records = results["action_bias_records"]
+        # Save action bias records as npz file
+        npz_filename = f"task{cfg.EVALUATION.task_id}_actions_bias.npz"
+        npz_path = action_bias_records_dir / npz_filename
+        # Convert action bias records to numpy arrays
+        np_action_bias_records = {str(trial_idx): np.array(actions_bias) for trial_idx, actions_bias in action_bias_records.items()}
+        np.savez(str(npz_path), **np_action_bias_records)
+        print(f"Saved action bias records to {npz_path}")
     
     del results["action_records"]
+    del results["action_bias_records"]
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, cls=NumpyEncoder)
 

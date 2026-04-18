@@ -37,6 +37,7 @@ EVALUATION:
   tiled: false
 
   record_actions: false
+  record_actions_bias: false
 
   # Optional external inputs
   dataset_stats_path: null
