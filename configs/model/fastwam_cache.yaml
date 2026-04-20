@@ -58,7 +58,7 @@ loss:
   lambda_action: 1.0
 
 dit_cache_config:
-  cache_type: "naivecache"
+  cache_type: "dreamzero"
   naivecache_config:
     cal_steps:
       - 0
@@ -75,11 +75,30 @@ dit_cache_config:
       - -0.038073982
   dreamzero_config:
     thresholds:
-      - 0.9
-      - 0.8
+      - 0.95
+      - 0.93
     countdowns:
       - 4
       - 2
   blockcache_config:
     interval: 4
     ratio: 0.4
+  batchstep_config:
+    batch1_cal_steps:
+      - 0
+      - 9
+    batch2_cal_steps:
+      - 0
+      - 1
+      - 5
+      - 9
+      # - 0
+      # - 1
+      # - 2
+      # - 3
+      # - 4
+      # - 5
+      # - 6
+      # - 7
+      # - 8
+      # - 9

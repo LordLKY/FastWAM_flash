@@ -21,6 +21,7 @@ infer_action_mapping = {
     'teacache': 'infer_action_with_teacache',
     'dreamzero': 'infer_action_with_dreamzero',
     'blockcache': 'infer_action_with_blockcache',
+    'batchstep': 'infer_action_with_batchstep',
 }
 
 class FastWAMCache(FastWAM):
@@ -75,6 +76,7 @@ class FastWAMCache(FastWAM):
             "teacache",
             "dreamzero",
             "blockcache",
+            "batchstep",
         ], f"Error: unsupported cache type {cache_type}"
         self.cache_type = cache_type
         self.infer_action = getattr(self, infer_action_mapping[cache_type])
@@ -196,6 +198,14 @@ class FastWAMCache(FastWAM):
         if self.cache_type == "blockcache":
             assert "blockcache_config" in dit_cache_config, "blockcache_config is required for blockcache cache"
             self.blockcache_config = dit_cache_config["blockcache_config"]
+        
+        # for batchstep
+        if self.cache_type == "batchstep":
+            assert "batchstep_config" in dit_cache_config, "batchstep_config is required for batchstep cache"
+            self.batchstep_config = dit_cache_config["batchstep_config"]
+            assert 0 in self.batchstep_config['batch1_cal_steps'] and 0 in self.batchstep_config['batch2_cal_steps'], "the first step must be calculated in both batches"
+            if len(self.batchstep_config['batch1_cal_steps']) > len(self.batchstep_config['batch2_cal_steps']):
+                self.batchstep_config['batch1_cal_steps'], self.batchstep_config['batch2_cal_steps'] = self.batchstep_config['batch2_cal_steps'], self.batchstep_config['batch1_cal_steps']
     
     @torch.no_grad()
     def infer_action_with_naivecache(
@@ -696,6 +706,7 @@ class FastWAMCache(FastWAM):
         skip_countdown = 0
         step_without_cache = 0
         step_with_cache = 0
+        cal_steps = []
         
         for i, (step_t_action, step_delta_action) in enumerate(zip(infer_timesteps_action, infer_deltas_action)):
             step_without_cache += 1
@@ -706,6 +717,7 @@ class FastWAMCache(FastWAM):
             
             if skip_countdown == 0:
                 step_with_cache += 1
+                cal_steps.append(i)
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
                 pred_action_posi = self._predict_action_noise_with_cache(
@@ -742,7 +754,7 @@ class FastWAMCache(FastWAM):
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
         
-        logger.info(f"runned {step_with_cache}/{step_without_cache} steps")
+        logger.info(f"runned {step_with_cache}/{step_without_cache} steps ({cal_steps})")
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
@@ -932,3 +944,228 @@ class FastWAMCache(FastWAM):
             blockcache_ratio=self.blockcache_config["ratio"],
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
+    
+    # for BatchStep
+    @torch.no_grad()
+    def infer_action_with_batchstep(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
+            )
+
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+            )
+        _, _, height, width = input_image.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
+            )
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim == 2 and proprio.shape[0] == 1:
+                pass
+            else:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (1, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be both provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context_mask.ndim != 2:
+                raise ValueError(
+                    f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+                )
+            context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if proprio is not None:
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=latents_action.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+
+        total_steps = len(infer_timesteps_action)  # len(zip(infer_timesteps_action, infer_deltas_action))
+        batch1_step_idx, batch2_step_idx = 0, 0
+        batch1_prev_pred, batch2_prev_pred = None, None
+        batch1_latents_action, batch2_latents_action = latents_action, latents_action.clone()
+        batch1_should_cal, batch2_should_cal = False, False
+
+        if context is not None:
+            batch_context = context.expand(2, *context.shape[1:])
+        if context_mask is not None:
+            batch_context_mask = context_mask.expand(2, *context_mask.shape[1:])
+
+        # for profiling
+        import time
+        time_records = []  
+
+        while batch1_step_idx < total_steps:  # or batch2_step_idx < total_steps:
+            batch1_should_cal = batch1_step_idx in self.batchstep_config['batch1_cal_steps']
+            batch2_should_cal = batch2_step_idx in self.batchstep_config['batch2_cal_steps']
+            should_cal = batch1_should_cal and batch2_should_cal
+
+            if should_cal:
+                # for profiling
+                torch.cuda.synchronize()
+                start_time = time.perf_counter()
+
+                batch1_step_t_action, batch1_step_delta_action = infer_timesteps_action[batch1_step_idx], infer_deltas_action[batch1_step_idx]
+                batch2_step_t_action, batch2_step_delta_action = infer_timesteps_action[batch2_step_idx], infer_deltas_action[batch2_step_idx]
+                batch1_timestep_action = batch1_step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+                batch2_timestep_action = batch2_step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+                combined_latents_action = torch.cat([batch1_latents_action, batch2_latents_action], dim=0)
+                combined_timestep_action = torch.cat([batch1_timestep_action, batch2_timestep_action], dim=0)
+                pred_action_posi = self._predict_action_noise_with_cache(
+                    latents_action=combined_latents_action,
+                    timestep_action=combined_timestep_action,
+                    context=batch_context,
+                    context_mask=batch_context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                )
+                batch1_pred_action, batch2_pred_action = pred_action_posi.chunk(2, dim=0)
+                batch1_prev_pred = batch1_pred_action.clone()
+                batch2_prev_pred = batch2_pred_action.clone()
+                batch1_latents_action = self.infer_action_scheduler.step(batch1_pred_action, batch1_step_delta_action, batch1_latents_action)
+                batch1_step_idx += 1
+                batch2_latents_action = self.infer_action_scheduler.step(batch2_pred_action, batch2_step_delta_action, batch2_latents_action)
+                batch2_step_idx += 1
+
+                # for profiling
+                torch.cuda.synchronize()
+                end_time = time.perf_counter()
+                time_records.append(end_time - start_time)
+
+                continue
+
+            if not batch1_should_cal:
+                batch1_latents_action = self.infer_action_scheduler.step(batch1_prev_pred, infer_deltas_action[batch1_step_idx], batch1_latents_action)
+                batch1_step_idx += 1
+            if not batch2_should_cal:
+                batch2_latents_action = self.infer_action_scheduler.step(batch2_prev_pred, infer_deltas_action[batch2_step_idx], batch2_latents_action)
+                batch2_step_idx += 1
+        
+        while batch2_step_idx < total_steps:
+            step_t_action, step_delta_action = infer_timesteps_action[batch2_step_idx], infer_deltas_action[batch2_step_idx]
+            if batch2_step_idx in self.batchstep_config['batch2_cal_steps']:
+                # for profiling
+                torch.cuda.synchronize()
+                start_time = time.perf_counter()
+                
+                timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+                pred_action_posi = self._predict_action_noise_with_cache(
+                    latents_action=batch2_latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                )
+                pred_action = pred_action_posi
+                batch2_prev_pred = pred_action.clone()
+                batch2_latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, batch2_latents_action)
+
+                # for profiling
+                torch.cuda.synchronize()
+                end_time = time.perf_counter()
+                time_records.append(end_time - start_time)
+            else:
+                batch2_latents_action = self.infer_action_scheduler.step(batch2_prev_pred, step_delta_action, batch2_latents_action)
+            batch2_step_idx += 1
+        
+        logger.info(f"time_records: {time_records}")
+
+        return {
+            "drift_action": batch1_latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": batch2_latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+        }
