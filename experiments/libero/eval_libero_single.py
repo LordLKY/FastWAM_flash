@@ -582,6 +582,9 @@ def run_single_episode(
         t += 1
     pbar.close()
 
+    if hasattr(model, "reset_episode"):
+        model.reset_episode()
+
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )

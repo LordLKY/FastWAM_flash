@@ -206,6 +206,12 @@ class FastWAMCache(FastWAM):
             assert 0 in self.batchstep_config['batch1_cal_steps'] and 0 in self.batchstep_config['batch2_cal_steps'], "the first step must be calculated in both batches"
             if len(self.batchstep_config['batch1_cal_steps']) > len(self.batchstep_config['batch2_cal_steps']):
                 self.batchstep_config['batch1_cal_steps'], self.batchstep_config['batch2_cal_steps'] = self.batchstep_config['batch2_cal_steps'], self.batchstep_config['batch1_cal_steps']
+            self.reference_action = None
+            self.replan_steps = 10
+    
+    def reset_episode(self):
+        if hasattr(self, "reference_action"):
+            self.reference_action = None
     
     @torch.no_grad()
     def infer_action_with_naivecache(
@@ -1083,20 +1089,12 @@ class FastWAMCache(FastWAM):
         if context_mask is not None:
             batch_context_mask = context_mask.expand(2, *context_mask.shape[1:])
 
-        # for profiling
-        import time
-        time_records = []  
-
         while batch1_step_idx < total_steps:  # or batch2_step_idx < total_steps:
             batch1_should_cal = batch1_step_idx in self.batchstep_config['batch1_cal_steps']
             batch2_should_cal = batch2_step_idx in self.batchstep_config['batch2_cal_steps']
             should_cal = batch1_should_cal and batch2_should_cal
 
             if should_cal:
-                # for profiling
-                torch.cuda.synchronize()
-                start_time = time.perf_counter()
-
                 batch1_step_t_action, batch1_step_delta_action = infer_timesteps_action[batch1_step_idx], infer_deltas_action[batch1_step_idx]
                 batch2_step_t_action, batch2_step_delta_action = infer_timesteps_action[batch2_step_idx], infer_deltas_action[batch2_step_idx]
                 batch1_timestep_action = batch1_step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
@@ -1119,12 +1117,6 @@ class FastWAMCache(FastWAM):
                 batch1_step_idx += 1
                 batch2_latents_action = self.infer_action_scheduler.step(batch2_pred_action, batch2_step_delta_action, batch2_latents_action)
                 batch2_step_idx += 1
-
-                # for profiling
-                torch.cuda.synchronize()
-                end_time = time.perf_counter()
-                time_records.append(end_time - start_time)
-
                 continue
 
             if not batch1_should_cal:
@@ -1137,10 +1129,6 @@ class FastWAMCache(FastWAM):
         while batch2_step_idx < total_steps:
             step_t_action, step_delta_action = infer_timesteps_action[batch2_step_idx], infer_deltas_action[batch2_step_idx]
             if batch2_step_idx in self.batchstep_config['batch2_cal_steps']:
-                # for profiling
-                torch.cuda.synchronize()
-                start_time = time.perf_counter()
-                
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
                 pred_action_posi = self._predict_action_noise_with_cache(
                     latents_action=batch2_latents_action,
@@ -1154,18 +1142,32 @@ class FastWAMCache(FastWAM):
                 pred_action = pred_action_posi
                 batch2_prev_pred = pred_action.clone()
                 batch2_latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, batch2_latents_action)
-
-                # for profiling
-                torch.cuda.synchronize()
-                end_time = time.perf_counter()
-                time_records.append(end_time - start_time)
             else:
                 batch2_latents_action = self.infer_action_scheduler.step(batch2_prev_pred, step_delta_action, batch2_latents_action)
             batch2_step_idx += 1
         
-        logger.info(f"time_records: {time_records}")
+        draft_action, action = batch1_latents_action[0], batch2_latents_action[0]
+        
+        assert action.ndim == 2 and action.shape[1] == 7, f"latents_action.shape: {action.shape}, should be (X, 7)"
+        reference_steps = min(self.replan_steps, action.shape[0] - self.replan_steps)
+        accept_draft = False
+        if self.reference_action is None:
+            accept_draft = True
+        else:
+            accept_draft = self.is_draft_accepted(draft_action[:reference_steps], self.reference_action[:reference_steps])
+        self.reference_action = action[self.replan_steps:].clone()
+
+        logger.info(f"accept draft? {accept_draft}")
 
         return {
-            "drift_action": batch1_latents_action[0].detach().to(device="cpu", dtype=torch.float32),
-            "action": batch2_latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            # "draft_action": draft_action.detach().to(device="cpu", dtype=torch.float32),
+            "draft_action": draft_action.detach().to(device="cpu", dtype=torch.float32),
+            "orig_action": action.detach().to(device="cpu", dtype=torch.float32),
+            "action": draft_action.detach().to(device="cpu", dtype=torch.float32) if accept_draft else action.detach().to(device="cpu", dtype=torch.float32),
         }
+    
+    def is_draft_accepted(self, draft_action, reference_action):
+        assert draft_action.shape == reference_action.shape and draft_action.shape[1] == 7, f"draft_action.shape: {draft_action.shape}, reference_action.shape: {reference_action.shape}"
+        delta_action = (draft_action - reference_action).mean(dim=0).abs()
+        xyz_delta, rot_delta = delta_action[:3], delta_action[3:6]
+        return xyz_delta.max() < 0.05 and rot_delta.max() < 0.03

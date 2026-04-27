@@ -58,11 +58,10 @@ loss:
   lambda_action: 1.0
 
 dit_cache_config:
-  cache_type: "dreamzero"
+  cache_type: "naivecache"
   naivecache_config:
     cal_steps:
       - 0
-      - 9
   teacache_config:
     step_start: 1
     step_end: 10
