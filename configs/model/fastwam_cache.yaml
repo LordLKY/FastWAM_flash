@@ -82,7 +82,7 @@ dit_cache_config:
   blockcache_config:
     interval: 4
     ratio: 0.4
-  batchstep_config:
+  speccache_config:
     batch1_cal_steps:
       - 0
       - 9
