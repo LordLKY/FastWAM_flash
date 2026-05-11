@@ -22,6 +22,7 @@ infer_action_mapping = {
     'dreamzero': 'infer_action_with_dreamzero',
     'blockcache': 'infer_action_with_blockcache',
     'batchstep': 'infer_action_with_batchstep',
+    'branchcache': 'infer_action_with_branchcache',
 }
 
 class FastWAMCache(FastWAM):
@@ -77,6 +78,7 @@ class FastWAMCache(FastWAM):
             "dreamzero",
             "blockcache",
             "batchstep",
+            "branchcache",
         ], f"Error: unsupported cache type {cache_type}"
         self.cache_type = cache_type
         self.infer_action = getattr(self, infer_action_mapping[cache_type])
@@ -208,6 +210,12 @@ class FastWAMCache(FastWAM):
                 self.batchstep_config['batch1_cal_steps'], self.batchstep_config['batch2_cal_steps'] = self.batchstep_config['batch2_cal_steps'], self.batchstep_config['batch1_cal_steps']
             self.reference_action = None
             self.replan_steps = 10
+        
+        # for branchcache
+        if self.cache_type == "branchcache":
+            assert "branchcache_config" in dit_cache_config, "branchcache_config is required for branchcache cache"
+            self.branchcache_config = dit_cache_config["branchcache_config"]
+            self.branch_steps_list = self.branchcache_config['branch_steps_list']
     
     def reset_episode(self):
         if hasattr(self, "reference_action"):
@@ -968,6 +976,7 @@ class FastWAMCache(FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        accept_signal: Optional[bool] = None,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -1148,14 +1157,17 @@ class FastWAMCache(FastWAM):
         
         draft_action, action = batch1_latents_action[0], batch2_latents_action[0]
         
-        assert action.ndim == 2 and action.shape[1] == 7, f"latents_action.shape: {action.shape}, should be (X, 7)"
-        reference_steps = min(self.replan_steps, action.shape[0] - self.replan_steps)
-        accept_draft = False
-        if self.reference_action is None:
-            accept_draft = True
+        if accept_signal is not None:
+            accept_draft = accept_signal
         else:
-            accept_draft = self.is_draft_accepted(draft_action[:reference_steps], self.reference_action[:reference_steps])
-        self.reference_action = action[self.replan_steps:].clone()
+            assert action.ndim == 2 and action.shape[1] == 7, f"latents_action.shape: {action.shape}, should be (X, 7)"
+            reference_steps = min(self.replan_steps, action.shape[0] - self.replan_steps)
+            accept_draft = False
+            if self.reference_action is None:
+                accept_draft = True
+            else:
+                accept_draft = self.is_draft_accepted(draft_action[:reference_steps], self.reference_action[:reference_steps])
+            self.reference_action = action[self.replan_steps:].clone()
 
         logger.info(f"accept draft? {accept_draft}")
 
@@ -1171,3 +1183,167 @@ class FastWAMCache(FastWAM):
         delta_action = (draft_action - reference_action).mean(dim=0).abs()
         xyz_delta, rot_delta = delta_action[:3], delta_action[3:6]
         return xyz_delta.max() < 0.05 and rot_delta.max() < 0.03
+    
+    # for branchcache (initial version for testing)
+    @torch.no_grad()
+    def infer_action_with_branchcache(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
+            )
+
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+            )
+        _, _, height, width = input_image.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
+            )
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim == 2 and proprio.shape[0] == 1:
+                pass
+            else:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (1, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be both provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context_mask.ndim != 2:
+                raise ValueError(
+                    f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+                )
+            context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if proprio is not None:
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=latents_action.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+
+        branch_latents_actions = []
+        final_latents_action = latents_action.clone().detach()
+        for branch_steps in self.branch_steps_list:
+            current_latents_action = latents_action.clone().detach()
+            latents_action_records = []
+            prev_pred = None
+
+            num_step = 0
+            for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+                if num_step in branch_steps or prev_pred is None:
+                    timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+
+                    pred_action_posi = self._predict_action_noise_with_cache(
+                        latents_action=current_latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                    )
+                    pred_action = pred_action_posi
+                    prev_pred = pred_action.clone().detach()
+                else:
+                    pred_action = prev_pred
+                
+                current_latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, current_latents_action)
+                latents_action_records.append(current_latents_action[0].clone().detach().to(device="cpu", dtype=torch.float32))
+                num_step += 1
+            final_latents_action = current_latents_action
+            branch_latents_actions.append(latents_action_records)
+
+        return {
+            "action": final_latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "branch_latents_action": branch_latents_actions,
+        }
