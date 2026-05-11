@@ -421,6 +421,10 @@ class MoT(nn.Module):
                 raise ValueError(
                     f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."
                 )
+            if k_video.shape[0] != k_action.shape[0]:
+                k_video = k_video.expand(k_action.shape[0], *k_video.shape[1:])
+            if v_video.shape[0] != v_action.shape[0]:
+                v_video = v_video.expand(v_action.shape[0], *v_video.shape[1:])
 
             # Mixed attention: action queries attend to cached video K/V plus current action K/V.
             k_cat = torch.cat([k_video, k_action], dim=1)

@@ -77,8 +77,8 @@ dit_cache_config:
       - -0.038073982
   dreamzero_config:
     thresholds:
-      - 0.9
-      - 0.8
+      - 0.95
+      - 0.93
     countdowns:
       - 4
       - 2
