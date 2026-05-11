@@ -21,7 +21,7 @@ infer_action_mapping = {
     'teacache': 'infer_action_with_teacache',
     'dreamzero': 'infer_action_with_dreamzero',
     'blockcache': 'infer_action_with_blockcache',
-    'batchstep': 'infer_action_with_batchstep',
+    'speccache': 'infer_action_with_speccache',
     'branchcache': 'infer_action_with_branchcache',
 }
 
@@ -77,7 +77,7 @@ class FastWAMCache(FastWAM):
             "teacache",
             "dreamzero",
             "blockcache",
-            "batchstep",
+            "speccache",
             "branchcache",
         ], f"Error: unsupported cache type {cache_type}"
         self.cache_type = cache_type
@@ -201,13 +201,13 @@ class FastWAMCache(FastWAM):
             assert "blockcache_config" in dit_cache_config, "blockcache_config is required for blockcache cache"
             self.blockcache_config = dit_cache_config["blockcache_config"]
         
-        # for batchstep
-        if self.cache_type == "batchstep":
-            assert "batchstep_config" in dit_cache_config, "batchstep_config is required for batchstep cache"
-            self.batchstep_config = dit_cache_config["batchstep_config"]
-            assert 0 in self.batchstep_config['batch1_cal_steps'] and 0 in self.batchstep_config['batch2_cal_steps'], "the first step must be calculated in both batches"
-            if len(self.batchstep_config['batch1_cal_steps']) > len(self.batchstep_config['batch2_cal_steps']):
-                self.batchstep_config['batch1_cal_steps'], self.batchstep_config['batch2_cal_steps'] = self.batchstep_config['batch2_cal_steps'], self.batchstep_config['batch1_cal_steps']
+        # for speccache
+        if self.cache_type == "speccache":
+            assert "speccache_config" in dit_cache_config, "speccache_config is required for speccache cache"
+            self.speccache_config = dit_cache_config["speccache_config"]
+            assert 0 in self.speccache_config['batch1_cal_steps'] and 0 in self.speccache_config['batch2_cal_steps'], "the first step must be calculated in both batches"
+            if len(self.speccache_config['batch1_cal_steps']) > len(self.speccache_config['batch2_cal_steps']):
+                self.speccache_config['batch1_cal_steps'], self.speccache_config['batch2_cal_steps'] = self.speccache_config['batch2_cal_steps'], self.speccache_config['batch1_cal_steps']
             self.reference_action = None
             self.replan_steps = 10
         
@@ -216,6 +216,7 @@ class FastWAMCache(FastWAM):
             assert "branchcache_config" in dit_cache_config, "branchcache_config is required for branchcache cache"
             self.branchcache_config = dit_cache_config["branchcache_config"]
             self.branch_steps_list = self.branchcache_config['branch_steps_list']
+            self.branch_merge_policy = self.branchcache_config['branch_merge_policy'] if "branch_merge_policy" in self.branchcache_config else "last"
     
     def reset_episode(self):
         if hasattr(self, "reference_action"):
@@ -959,9 +960,9 @@ class FastWAMCache(FastWAM):
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
     
-    # for BatchStep
+    # for SpecCache
     @torch.no_grad()
-    def infer_action_with_batchstep(
+    def infer_action_with_speccache(
         self,
         prompt: Optional[str],
         input_image: torch.Tensor,
@@ -1099,8 +1100,8 @@ class FastWAMCache(FastWAM):
             batch_context_mask = context_mask.expand(2, *context_mask.shape[1:])
 
         while batch1_step_idx < total_steps:  # or batch2_step_idx < total_steps:
-            batch1_should_cal = batch1_step_idx in self.batchstep_config['batch1_cal_steps']
-            batch2_should_cal = batch2_step_idx in self.batchstep_config['batch2_cal_steps']
+            batch1_should_cal = batch1_step_idx in self.speccache_config['batch1_cal_steps']
+            batch2_should_cal = batch2_step_idx in self.speccache_config['batch2_cal_steps']
             should_cal = batch1_should_cal and batch2_should_cal
 
             if should_cal:
@@ -1137,7 +1138,7 @@ class FastWAMCache(FastWAM):
         
         while batch2_step_idx < total_steps:
             step_t_action, step_delta_action = infer_timesteps_action[batch2_step_idx], infer_deltas_action[batch2_step_idx]
-            if batch2_step_idx in self.batchstep_config['batch2_cal_steps']:
+            if batch2_step_idx in self.speccache_config['batch2_cal_steps']:
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
                 pred_action_posi = self._predict_action_noise_with_cache(
                     latents_action=batch2_latents_action,
@@ -1342,8 +1343,15 @@ class FastWAMCache(FastWAM):
                 num_step += 1
             final_latents_action = current_latents_action
             branch_latents_actions.append(latents_action_records)
+        
+        if self.branch_merge_policy == 'last':
+            output_action = final_latents_action[0].detach().to(device="cpu", dtype=torch.float32)
+        elif self.branch_merge_policy == 'mean':
+            output_action = torch.stack(branch_latents_actions, dim=0).mean(dim=0)[0].detach().to(device="cpu", dtype=torch.float32)
+        else:
+            raise ValueError(f"Unknown branch_merge_policy: {self.branch_merge_policy}")
 
         return {
-            "action": final_latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": output_action,
             "branch_latents_action": branch_latents_actions,
         }
