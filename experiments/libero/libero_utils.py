@@ -166,6 +166,7 @@ def quat2axisangle(quat):
     Returns:
         np.array: (ax,ay,az) axis-angle exponential coordinates
     """
+    # quat = np.array([quat[1], quat[2], quat[3], quat[0]])
     # clip quaternion
     if quat[3] > 1.0:
         quat[3] = 1.0

@@ -16,6 +16,10 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from tqdm import tqdm
 
+# rotation utils
+import transforms3d as t3d
+from scipy.spatial.transform import Rotation
+
 # try:
 #     import rootutils
 
@@ -253,6 +257,18 @@ def _extract_sim_state(obs: dict) -> np.ndarray:
             obs["robot0_gripper_qpos"],
         )
     ).astype(np.float32)
+
+    # logging.info(f"NOTE: state quat: {obs['robot0_eef_quat']}")
+
+    try:
+        assert state.shape == (8,)
+    except AssertionError:
+        logging.info(f"pos: {obs['robot0_eef_pos']}")
+        logging.info(f"axis_angle: {quat2axisangle(obs['robot0_eef_quat'])}")
+        logging.info(f"gripper: {obs['robot0_gripper_qpos']}")
+        logging.error(f"State shape is {state.shape}, expected (8,).")
+        raise ValueError(f"State shape is {state.shape}, expected (8,).")
+
     return state
 
 
@@ -367,6 +383,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    accept_signal: Optional[bool] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -403,6 +420,8 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if model.cache_type == 'batchstep':
+        infer_kwargs["accept_signal"] = accept_signal
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -417,6 +436,8 @@ def _predict_action_chunk(
         else:
             pred = model.infer_action(**infer_kwargs)
     action = pred["action"]  # [T, D]
+    draft_action = pred.get("draft_action", None)
+    orig_action = pred.get("orig_action", None)
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -426,7 +447,24 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
-    return action, imgs, predicted_future_frames
+    
+    if draft_action is not None:
+        draft_action = _denormalize_action(draft_action, processor)[0]  # [T, D]
+        draft_action[..., -1] = draft_action[..., -1] * 2 - 1
+        draft_action = invert_gripper_action(draft_action)
+        if bool(cfg.EVALUATION.get("binarize_gripper", False)):
+            draft_action[..., -1] = np.sign(draft_action[..., -1])
+        
+    if orig_action is not None:
+        orig_action = _denormalize_action(orig_action, processor)[0]  # [T, D]
+        orig_action[..., -1] = orig_action[..., -1] * 2 - 1
+        orig_action = invert_gripper_action(orig_action)
+        if bool(cfg.EVALUATION.get("binarize_gripper", False)):
+            orig_action[..., -1] = np.sign(orig_action[..., -1])
+    
+    action_pkg = {"action": action, "draft_action": draft_action, "orig_action": orig_action}
+
+    return action_pkg, imgs, predicted_future_frames
 
 
 def _get_max_steps(task_suite_name: str) -> int:
@@ -441,6 +479,153 @@ def _get_max_steps(task_suite_name: str) -> int:
         raise ValueError(f"Unknown task suite: {task_suite_name}")
     return suite_steps[task_suite_name]
 
+# rotation_utils
+def axis_angle_to_rotation_matrix(axis_angle: np.ndarray) -> np.ndarray:
+    axis_angle = np.asarray(axis_angle, dtype=np.float64).reshape(3)
+    angle = np.linalg.norm(axis_angle)
+    if angle < 1e-12:
+        return np.eye(3, dtype=np.float64)
+
+    x, y, z = axis_angle / angle
+    skew = np.array(
+        [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]],
+        dtype=np.float64,
+    )
+    return (
+        np.eye(3, dtype=np.float64)
+        + np.sin(angle) * skew
+        + (1.0 - np.cos(angle)) * (skew @ skew)
+    )
+def rotation_matrix_to_axis_angle(rotation_matrix: np.ndarray) -> np.ndarray:
+    def project_to_so3(rotation_matrix: np.ndarray) -> np.ndarray:
+        u, _, vh = np.linalg.svd(np.asarray(rotation_matrix, dtype=np.float64))
+        projected = u @ vh
+        if np.linalg.det(projected) < 0:
+            u[:, -1] *= -1.0
+            projected = u @ vh
+        return projected
+    rotation_matrix = project_to_so3(rotation_matrix)
+    trace = float(np.trace(rotation_matrix))
+    cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+    angle = float(np.arccos(cos_angle))
+
+    if angle < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+
+    if abs(np.pi - angle) < 1e-6:
+        diag = np.diag(rotation_matrix)
+        axis = np.sqrt(np.maximum((diag + 1.0) / 2.0, 0.0))
+        if rotation_matrix[0, 1] < 0.0:
+            axis[1] = -axis[1]
+        if rotation_matrix[0, 2] < 0.0:
+            axis[2] = -axis[2]
+        if np.linalg.norm(axis) < 1e-12:
+            axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            axis = axis / np.linalg.norm(axis)
+        return axis * angle
+
+    axis = np.array(
+        [
+            rotation_matrix[2, 1] - rotation_matrix[1, 2],
+            rotation_matrix[0, 2] - rotation_matrix[2, 0],
+            rotation_matrix[1, 0] - rotation_matrix[0, 1],
+        ],
+        dtype=np.float64,
+    ) / (2.0 * np.sin(angle))
+    return axis * angle
+def euler_to_rotation_matrix(euler: np.ndarray) -> np.ndarray:
+    euler = np.asarray(euler, dtype=np.float64).reshape(3)
+    return np.asarray(t3d.euler.euler2mat(euler[0], euler[1], euler[2]), dtype=np.float64)
+def rotation_matrix_to_euler(rotation_matrix: np.ndarray) -> np.ndarray:
+    euler = t3d.euler.mat2euler(np.asarray(rotation_matrix, dtype=np.float64))
+    return np.asarray(euler, dtype=np.float64)
+
+def _relative_to_absolute(action_chunk, state=None):
+    action_chunk = np.array(action_chunk)
+    if not isinstance(action_chunk, np.ndarray):
+        raise TypeError("action_chunk should be np.ndarray")
+    if action_chunk.ndim != 2:
+        raise ValueError(f"action_chunk should be 2D, got shape={action_chunk.shape}")
+
+    # assert isinstance(state, np.ndarray), f"state should be np.ndarray, got {type(state)}, state={state}"
+    # assert state.shape == (7,), f"state should be shape (7,), got shape={state.shape}"
+
+    relative_dims = 6  # int(self.relative_action_dims)
+    if relative_dims <= 0:
+        return action_chunk.copy()
+    if action_chunk.shape[1] < relative_dims:
+        raise ValueError(
+            f"relative_action_dims={relative_dims} exceeds action dim {action_chunk.shape[1]}"
+        )
+
+    absolute_chunk = action_chunk.copy()
+    position_dims = 3  # min(relative_dims, 3)
+    if state is None:
+        position_state = np.zeros(position_dims, dtype=np.float64)
+    else:
+        position_state = np.asarray(state[:3], dtype=np.float64)  # np.zeros(position_dims, dtype=np.float64)
+    tail_dims = max(relative_dims - 6, 0)
+    if tail_dims > 0:
+        if state is None:
+            tail_state = np.zeros(tail_dims, dtype=np.float64)
+        else:
+            tail_state = np.asarray(state[6:relative_dims], dtype=np.float64)  # np.zeros(tail_dims, dtype=np.float64)
+    if state is None:
+        rotation_state = np.eye(3, dtype=np.float64)
+    else:
+        rotation_state = axis_angle_to_rotation_matrix(np.asarray(state[3:6], dtype=np.float64))
+
+    # logging.info(f"NOTE: state axis_angle: {state[3:6]}")
+
+    for idx, action in enumerate(action_chunk):
+        if position_dims > 0:
+            position_state = position_state + np.asarray(action[:position_dims], dtype=np.float64)
+            absolute_chunk[idx, :position_dims] = position_state.astype(
+                absolute_chunk.dtype, copy=False
+            )
+        if relative_dims >= 6:
+            rotation_state = axis_angle_to_rotation_matrix(
+                np.asarray(action[3:6], dtype=np.float64)
+            ) @ rotation_state
+            absolute_chunk[idx, 3:6] = rotation_matrix_to_axis_angle(
+                rotation_state
+            ).astype(
+                absolute_chunk.dtype, copy=False
+            )
+        if tail_dims > 0:
+            tail_state = tail_state + np.asarray(action[6:relative_dims], dtype=np.float64)
+            absolute_chunk[idx, 6:relative_dims] = tail_state.astype(
+                absolute_chunk.dtype, copy=False
+            )
+    # logging.info(f"NOTE: accumulated axis_angle: {absolute_chunk[-1, 3:6]}")
+    absolute_chunk = absolute_chunk.tolist()
+    return absolute_chunk, absolute_chunk[-1]
+
+
+def _accumulate_action(action, state):
+    """Accumulate action to state."""
+    position_state = np.asarray(state[:3], dtype=np.float64)  # np.zeros(position_dims, dtype=np.float64)
+    rotation_state = axis_angle_to_rotation_matrix(np.asarray(state[3:6], dtype=np.float64))
+
+    position_state = position_state + np.asarray(action[:3], dtype=np.float64)
+    rotation_state = axis_angle_to_rotation_matrix(
+        np.asarray(action[3:6], dtype=np.float64)
+    ) @ rotation_state
+    return position_state.tolist() + rotation_matrix_to_axis_angle(rotation_state).tolist()
+
+def rotation_distance(aa1, aa2):
+    r1 = Rotation.from_rotvec(aa1)
+    r2 = Rotation.from_rotvec(aa2)
+    r_diff = r1.inv() * r2
+    return np.linalg.norm(r_diff.as_rotvec())
+
+def rotation_delta(state1_aa, state2_aa):
+    r1 = Rotation.from_rotvec(state1_aa)
+    r2 = Rotation.from_rotvec(state2_aa)
+    # R_delta = R2 @ R1^{-1}
+    r_delta = r2 * r1.inv()
+    return r_delta.as_rotvec()
 
 def run_single_episode(
     env,
@@ -466,9 +651,17 @@ def run_single_episode(
     # record actions (optional)
     record_actions = bool(cfg.EVALUATION.get("record_actions", False))
     record_actions_bias = bool(cfg.EVALUATION.get("record_actions_bias", False))
-    action_array = []
+    use_absolute_actions = bool(cfg.EVALUATION.get("absolute_actions", False))
+    action_array, draft_action_array, orig_action_array = [], [], []
+    action_state, draft_action_state, orig_action_state = None, None, None
     action_bias_array = []
     prev_extra_actions = []
+
+    use_batchstep = model.cache_type == "batchstep"
+    accept_signal = None
+    if use_batchstep:
+        accept_signal = False
+    fix_actions = []
 
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -495,7 +688,7 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
-            action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
+            action_pkg, imgs, predicted_future_frames = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
                 model=model,
@@ -505,7 +698,13 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                accept_signal=accept_signal,
             )
+
+            action_chunk = action_pkg["action"]
+            draft_action_chunk = action_pkg["draft_action"]
+            orig_action_chunk = action_pkg["orig_action"]
+
             if predicted_future_frames is not None:
                 current_replan_idx += 1
                 current_predicted_future_clip = {
@@ -519,8 +718,18 @@ def run_single_episode(
             if use_action_ensembler:
                 ensembler.add_actions(action_chunk, t)
                 pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
+
+                if draft_action_chunk is not None:
+                    pending_draft_actions = [draft_action_chunk[ts].tolist() for ts in range(t, t + replan_steps)]
+                if orig_action_chunk is not None:
+                    pending_orig_actions = [orig_action_chunk[ts].tolist() for ts in range(t, t + replan_steps)]
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
+
+                if draft_action_chunk is not None:
+                    pending_draft_actions = draft_action_chunk[:replan_steps].tolist()
+                if orig_action_chunk is not None:
+                    pending_orig_actions = orig_action_chunk[:replan_steps].tolist()
 
                 # for action bias
                 if record_actions_bias:
@@ -533,13 +742,67 @@ def run_single_episode(
                     prev_extra_actions = action_chunk[replan_steps:2 * replan_steps].tolist()
             replay_images.append(imgs.copy())
 
+            # if len(fix_actions) > 0:
+            #     pending_actions = fix_actions + pending_actions
+            
+            # if use_absolute_actions:
+            #     logging.info("NOTE: record absolute actions")
+            #     current_state = _extract_sim_state(obs)[:7]
+            pending_actions_absolute, action_state = _relative_to_absolute(pending_actions, state=action_state)
+            if draft_action_chunk is not None:
+                pending_draft_actions, draft_action_state = _relative_to_absolute(pending_draft_actions, state=draft_action_state)
+            if orig_action_chunk is not None:
+                pending_orig_actions, orig_action_state = _relative_to_absolute(pending_orig_actions, state=orig_action_state)
+            
+            if use_batchstep:
+                accept_signal = rotation_distance(action_state[3:6], orig_action_state[3:6]) < 0.05
+                if not accept_signal:
+                    # fix with target model
+                    fix_xyz = np.array(orig_action_state[:3]) - np.array(action_state[:3])
+                    fix_angle = rotation_delta(action_state[3:6], orig_action_state[3:6])
+                    fix_gripper = np.array(pending_actions[-1][6:])
+                    fix_action = np.concatenate(
+                        (
+                            fix_xyz,
+                            fix_angle,
+                            fix_gripper,
+                        )
+                    ).astype(np.float32).tolist()
+                    assert type(fix_action) == type(pending_actions[-1]), f"type of existing action: {type(pending_actions[-1])}, type of new action: {type(fix_action)}"
+                    assert len(fix_action) == len(pending_actions[-1]), f"fix_action {fix_action} and pending_actions[-1] {pending_actions[-1]} have different shape"
+                    fix_actions = [fix_action]
+                    pending_actions = pending_actions + fix_actions
+                    _, action_state = _relative_to_absolute(fix_actions, state=action_state)
+                    accept_signal = True
+                    logging.info(f"NOTE: fix action here")
+
             if record_actions:
-                action_array += pending_actions
+                action_array += pending_actions_absolute if use_absolute_actions else pending_actions
+                if draft_action_chunk is not None:
+                    draft_action_array += pending_draft_actions
+                if orig_action_chunk is not None:
+                    orig_action_array += pending_orig_actions
         else:
             imgs = get_libero_image(obs)
             replay_images.append(imgs.copy())
 
+    # debug
+        # current_state = _extract_sim_state(obs)[:7]
+        # # logging.info(f"axis_angle_2: {current_state[3:6]}")
+        # logging.info(f"real_before_state: {current_state[:6]}")
+        # axis_angle_1 = pending_actions[0][3:6]
+        # # logging.info(f"axis_angle_1: {axis_angle_1}")
+        # logging.info(f"current_action: {pending_actions[0][:6]}")
+        # state_after_action = _accumulate_action(pending_actions[0], current_state)
+        # logging.info(f"after_state: {state_after_action[:6]}")
+        
         obs, _, done, _ = env.step(pending_actions.pop(0))
+        
+    # debug
+        # current_state = _extract_sim_state(obs)[:7]
+        # # logging.info(f"axis_angle_2: {current_state[3:6]}")
+        # logging.info(f"real_after_state: {current_state[:6]}")
+
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
@@ -595,10 +858,20 @@ def run_single_episode(
         t += 1
     pbar.close()
 
+    if hasattr(model, "reset_episode"):
+        model.reset_episode()
+
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_array, action_bias_array
+
+    action_array_pkg = {
+        "action": action_array,
+        "draft_action": draft_action_array if len(draft_action_array) > 0 else None,
+        "orig_action": orig_action_array if len(orig_action_array) > 0 else None,
+    }
+
+    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_array_pkg, action_bias_array
 
 
 def run_single_task(
@@ -630,11 +903,11 @@ def run_single_task(
     # record actions (optional)
     record_actions = bool(cfg.EVALUATION.get("record_actions", False))
     record_actions_bias = bool(cfg.EVALUATION.get("record_actions_bias", False))
-    action_records = {}
+    action_records, draft_action_records, orig_action_records = {}, {}, {}
     action_bias_records = {}
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_array, action_bias_array = run_single_episode(
+        success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_array_pkg, action_bias_array = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -694,7 +967,11 @@ def run_single_task(
                     task_description=task_description,
                 )
         if record_actions:
-            action_records[f"trial_{trial_idx}"] = action_array
+            action_records[f"trial_{trial_idx}"] = action_array_pkg['action']
+            if action_array_pkg['draft_action'] is not None:
+                draft_action_records[f"trial_{trial_idx}"] = action_array_pkg['draft_action']
+            if action_array_pkg['orig_action'] is not None:
+                orig_action_records[f"trial_{trial_idx}"] = action_array_pkg['orig_action']
         if record_actions_bias:
             action_bias_records[f"trial_{trial_idx}"] = action_bias_array
 
@@ -703,6 +980,8 @@ def run_single_task(
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
     results["action_records"] = action_records
+    results["draft_action_records"] = draft_action_records
+    results["orig_action_records"] = orig_action_records
     results["action_bias_records"] = action_bias_records
     return results
 
@@ -774,6 +1053,10 @@ def eval_single_process(cfg: DictConfig):
     if record_actions:
         action_records_dir = Path(cfg.EVALUATION.output_dir) / "action_records" / cfg.EVALUATION.task_suite_name
         action_records_dir.mkdir(parents=True, exist_ok=True)
+        draft_action_records_dir = Path(cfg.EVALUATION.output_dir) / "draft_action_records" / cfg.EVALUATION.task_suite_name
+        draft_action_records_dir.mkdir(parents=True, exist_ok=True)
+        orig_action_records_dir = Path(cfg.EVALUATION.output_dir) / "orig_action_records" / cfg.EVALUATION.task_suite_name
+        orig_action_records_dir.mkdir(parents=True, exist_ok=True)
     record_actions_bias = bool(cfg.EVALUATION.get("record_actions_bias", False))
     action_bias_records_dir = None
     if record_actions_bias:
@@ -818,15 +1101,25 @@ def eval_single_process(cfg: DictConfig):
     output_file = output_dir / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_results.json"
     
     # record actions (optional)
-    if record_actions:
-        action_records = results["action_records"]
-        # Save action records as npz file
-        npz_filename = f"task{cfg.EVALUATION.task_id}_actions.npz"
-        npz_path = action_records_dir / npz_filename
+    def save_actions(action_records, npz_path):
         # Convert action records to numpy arrays
         np_action_records = {str(trial_idx): np.array(actions) for trial_idx, actions in action_records.items()}
         np.savez(str(npz_path), **np_action_records)
         print(f"Saved action records to {npz_path}")
+    if record_actions:
+        action_records = results["action_records"]
+        draft_action_records = results["draft_action_records"]
+        orig_action_records = results["orig_action_records"]
+        # Save action records as npz file
+        npz_filename = f"task{cfg.EVALUATION.task_id}_actions.npz"
+        npz_path = action_records_dir / npz_filename
+        draft_npz_path = draft_action_records_dir / npz_filename
+        orig_npz_path = orig_action_records_dir / npz_filename
+        save_actions(action_records, npz_path)
+        if len(draft_action_records) > 0:
+            save_actions(draft_action_records, draft_npz_path)
+        if len(orig_action_records) > 0:
+            save_actions(orig_action_records, orig_npz_path)
     if record_actions_bias:
         action_bias_records = results["action_bias_records"]
         # Save action bias records as npz file
@@ -839,6 +1132,10 @@ def eval_single_process(cfg: DictConfig):
     
     del results["action_records"]
     del results["action_bias_records"]
+    if 'draft_action_records' in results:
+        del results['draft_action_records']
+    if 'orig_action_records' in results:
+        del results['orig_action_records']
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, cls=NumpyEncoder)
 
