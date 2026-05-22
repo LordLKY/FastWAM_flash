@@ -58,7 +58,7 @@ loss:
   lambda_action: 1.0
 
 dit_cache_config:
-  cache_type: "naivecache"
+  cache_type: "branchcache"
   naivecache_config:
     cal_steps:
       - 0
@@ -101,3 +101,9 @@ dit_cache_config:
       # - 7
       # - 8
       # - 9
+  branchcache_config:
+    branch_merge_policy: "mean"
+    branch_steps_list:
+      - [0, 1]
+      - [0, 5]
+      - [0, 9]
