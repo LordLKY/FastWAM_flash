@@ -420,7 +420,7 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
-    if model.cache_type == 'batchstep':
+    if model.cache_type == 'speccache':
         infer_kwargs["accept_signal"] = accept_signal
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
@@ -652,16 +652,17 @@ def run_single_episode(
     record_actions = bool(cfg.EVALUATION.get("record_actions", False))
     record_actions_bias = bool(cfg.EVALUATION.get("record_actions_bias", False))
     use_absolute_actions = bool(cfg.EVALUATION.get("absolute_actions", False))
+    record_fixed_actions = bool(cfg.EVALUATION.get("record_fixed_actions", False)) and model.cache_type == "speccache"
     action_array, draft_action_array, orig_action_array = [], [], []
     action_state, draft_action_state, orig_action_state = None, None, None
     action_bias_array = []
     prev_extra_actions = []
+    fixed_actions = {}
 
-    use_batchstep = model.cache_type == "batchstep"
+    use_speccache = model.cache_type == "speccache"
     accept_signal = None
-    if use_batchstep:
+    if use_speccache:
         accept_signal = False
-    fix_actions = []
 
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -678,6 +679,7 @@ def run_single_episode(
     current_replan_idx = -1
 
     t = 0
+    chunk_id = 0
     done = False
     pbar = tqdm(total=max_steps + num_steps_wait, desc=f"Episode {episode_idx + 1}")
     while t < max_steps + num_steps_wait:
@@ -754,7 +756,7 @@ def run_single_episode(
             if orig_action_chunk is not None:
                 pending_orig_actions, orig_action_state = _relative_to_absolute(pending_orig_actions, state=orig_action_state)
             
-            if use_batchstep:
+            if use_speccache:
                 accept_signal = rotation_distance(action_state[3:6], orig_action_state[3:6]) < 0.05
                 if not accept_signal:
                     # fix with target model
@@ -775,6 +777,9 @@ def run_single_episode(
                     _, action_state = _relative_to_absolute(fix_actions, state=action_state)
                     accept_signal = True
                     logging.info(f"NOTE: fix action here")
+                    
+                if record_fixed_actions:
+                    fixed_actions[f"chunk_{chunk_id}"] = np.array(pending_actions)
 
             if record_actions:
                 action_array += pending_actions_absolute if use_absolute_actions else pending_actions
@@ -782,6 +787,8 @@ def run_single_episode(
                     draft_action_array += pending_draft_actions
                 if orig_action_chunk is not None:
                     orig_action_array += pending_orig_actions
+            
+            chunk_id += 1
         else:
             imgs = get_libero_image(obs)
             replay_images.append(imgs.copy())
@@ -870,6 +877,18 @@ def run_single_episode(
         "draft_action": draft_action_array if len(draft_action_array) > 0 else None,
         "orig_action": orig_action_array if len(orig_action_array) > 0 else None,
     }
+
+    # Save fixed actions as npz file
+    if record_fixed_actions and len(fixed_actions.items()) > 0:
+        # Create output directory
+        fixed_actions_dir = Path(cfg.EVALUATION.output_dir) / "fixed_actions_records" / cfg.EVALUATION.task_suite_name
+        fixed_actions_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save fixed actions with task_id and episode_idx
+        npz_filename = f"task{cfg.EVALUATION.task_id}_trial{episode_idx}_fixed_actions.npz"
+        npz_path = fixed_actions_dir / npz_filename
+        np.savez(str(npz_path), **fixed_actions)
+        print(f"Saved fixed actions to {npz_path}")
 
     return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_array_pkg, action_bias_array
 
