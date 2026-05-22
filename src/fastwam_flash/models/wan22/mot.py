@@ -5,6 +5,10 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
+import time
+from sklearn.decomposition import PCA
+import numpy as np
+
 from .wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam_flash.utils.logging_config import get_logger
 
@@ -798,5 +802,332 @@ class MoT(nn.Module):
 
             self.block_residual_cache[layer_idx] = x - orig_x
             self.block_rmae_cache[layer_idx] = ((x - orig_x).abs().mean() / (orig_x.abs().mean() + 1e-8)).float().item()
+
+        return x
+    
+    def forward_action_with_video_cache_and_parablock(
+        self,
+        action_tokens: torch.Tensor,
+        action_freqs: torch.Tensor,
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        recompute_threshold: float = 0.25,
+    ) -> tuple[torch.Tensor, int]:
+        """Run action branch with cached video K/V instead of recomputing video tokens.
+
+        Args:
+            action_tokens: Action tokens before layer 0, shape [B, Sa, D].
+            action_freqs: Action RoPE frequencies, shape [Sa, 1, rope_dim].
+            action_t_mod: Action time modulation tensor.
+            action_context_payload: Optional dict for action cross-attention.
+                - `context`: encoder states [B, L, D]
+                - `mask`: attention mask [B, Sa, L] or [B, 1, Sa, L]
+            video_kv_cache: Layer-wise cached video K/V from `prefill_video_cache`.
+            attention_mask: Joint [video+action] mask, shape [Sv+Sa, Sv+Sa].
+            video_seq_len: Video token count `Sv` in the joint sequence prefix.
+
+        Returns:
+            Updated action tokens after all layers, shape [B, Sa, D].
+        """
+        if "action" not in self.mixtures:
+            raise ValueError("MoT requires `action` expert for `forward_action_with_video_cache`.")
+        if len(video_kv_cache) != self.num_layers:
+            raise ValueError(
+                f"`video_kv_cache` must contain {self.num_layers} layers, got {len(video_kv_cache)}."
+            )
+        if attention_mask.ndim != 2:
+            raise ValueError(f"`attention_mask` must be 2D [S,S], got shape {tuple(attention_mask.shape)}")
+        if attention_mask.shape[0] != attention_mask.shape[1]:
+            raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
+
+        action_seq_len = int(action_tokens.shape[1])
+        total_seq_len = int(video_seq_len) + action_seq_len
+        if attention_mask.shape[0] != total_seq_len:
+            raise ValueError(
+                "`attention_mask` seq length mismatch: "
+                f"mask={attention_mask.shape[0]} vs expected_total={total_seq_len}"
+            )
+        # Use the action query rows from the joint [video+action] mask.
+        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+
+        expert = self.mixtures["action"]
+        x = action_tokens
+
+        def cal_layer(x, layer_idx):
+            block = expert.blocks[layer_idx]
+            # Action query/key/value are still step-dependent and must be recomputed each step.
+            (
+                q_action,
+                k_action,
+                v_action,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=action_freqs,
+                t_mod=action_t_mod,
+            )
+            layer_cache = video_kv_cache[layer_idx]
+            if "k" not in layer_cache or "v" not in layer_cache:
+                raise ValueError(
+                    f"`video_kv_cache[{layer_idx}]` must contain `k` and `v`."
+                )
+
+            k_video = layer_cache["k"]
+            v_video = layer_cache["v"]
+            if k_video.shape[1] != video_seq_len or v_video.shape[1] != video_seq_len:
+                raise ValueError(
+                    f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."
+                )
+            if k_video.shape[0] != k_action.shape[0]:
+                k_video = k_video.expand(k_action.shape[0], *k_video.shape[1:])
+            if v_video.shape[0] != v_action.shape[0]:
+                v_video = v_video.expand(v_action.shape[0], *v_video.shape[1:])
+
+            # Mixed attention: action queries attend to cached video K/V plus current action K/V.
+            k_cat = torch.cat([k_video, k_action], dim=1)
+            v_cat = torch.cat([v_video, v_action], dim=1)
+            mixed = self._mixed_attention(
+                q_cat=q_action,
+                k_cat=k_cat,
+                v_cat=v_cat,
+                attention_mask=action_attention_mask,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                mixed_slice=mixed,
+                context_payload=action_context_payload,
+            )
+            return x
+
+        layer_idx = 0
+        cal_layer_num = 0
+        x_cache3 = []
+        while layer_idx < self.num_layers:
+            x_1 = cal_layer(x, layer_idx)
+            layer_idx += 1
+            cal_layer_num += 1
+
+            if layer_idx == self.num_layers:
+                x = x_1
+                break
+
+            x_2 = None
+            if len(x_cache3) == 3:
+                x_1_pred = 3 * x_cache3[2] - 3 * x_cache3[1] + x_cache3[0]
+                mae = torch.abs(x_1_pred - x_1).mean()
+                mean_abs = torch.abs(x_1).mean()
+                rmae = (mae / (mean_abs + 1e-8)).item()
+                if rmae <= recompute_threshold:
+                    x_2 = cal_layer(x_1_pred, layer_idx + 1) - x_1_pred + x_1
+                    layer_idx += 1
+            x_cache3.append(x_1)
+            if x_2 is not None:
+                x_cache3.append(x_2)
+            if len(x_cache3) > 3:
+                x_cache3 = x_cache3[-3:]
+            x = x_2 if x_2 is not None else x_1
+
+        return x, cal_layer_num
+
+    def forward_action_with_video_cache_and_blockcurvecache(
+        self,
+        action_tokens: torch.Tensor,
+        action_freqs: torch.Tensor,
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        enable_blockcache: bool = False,
+        blockcache_ratio: float = 0.6,
+        use_pca: bool = False
+    ):
+        """Run action branch with cached video K/V instead of recomputing video tokens.
+
+        Args:
+            action_tokens: Action tokens before layer 0, shape [B, Sa, D].
+            action_freqs: Action RoPE frequencies, shape [Sa, 1, rope_dim].
+            action_t_mod: Action time modulation tensor.
+            action_context_payload: Optional dict for action cross-attention.
+                - `context`: encoder states [B, L, D]
+                - `mask`: attention mask [B, Sa, L] or [B, 1, Sa, L]
+            video_kv_cache: Layer-wise cached video K/V from `prefill_video_cache`.
+            attention_mask: Joint [video+action] mask, shape [Sv+Sa, Sv+Sa].
+            video_seq_len: Video token count `Sv` in the joint sequence prefix.
+
+        Returns:
+            Updated action tokens after all layers, shape [B, Sa, D].
+        """
+        # init block cache
+        if not hasattr(self, "block_residual_cache"):
+            self.block_residual_cache = {}
+        if not hasattr(self, "block_output_cache"):
+            self.block_output_cache = {}
+        
+        if "action" not in self.mixtures:
+            raise ValueError("MoT requires `action` expert for `forward_action_with_video_cache`.")
+        if len(video_kv_cache) != self.num_layers:
+            raise ValueError(
+                f"`video_kv_cache` must contain {self.num_layers} layers, got {len(video_kv_cache)}."
+            )
+        if attention_mask.ndim != 2:
+            raise ValueError(f"`attention_mask` must be 2D [S,S], got shape {tuple(attention_mask.shape)}")
+        if attention_mask.shape[0] != attention_mask.shape[1]:
+            raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
+
+        action_seq_len = int(action_tokens.shape[1])
+        total_seq_len = int(video_seq_len) + action_seq_len
+        if attention_mask.shape[0] != total_seq_len:
+            raise ValueError(
+                "`attention_mask` seq length mismatch: "
+                f"mask={attention_mask.shape[0]} vs expected_total={total_seq_len}"
+            )
+        # Use the action query rows from the joint [video+action] mask.
+        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+
+        expert = self.mixtures["action"]
+        x = action_tokens
+        
+        skip_blocks_list = []
+        skip_blocks_num = int(self.num_layers * blockcache_ratio)
+        if len(self.block_output_cache.items()) > 0 and enable_blockcache:
+            time_start = time.perf_counter()
+            cache_tensors = self.block_output_cache
+
+            flattened_list = [v.flatten() for k, v in cache_tensors.items()]
+            X = torch.stack(flattened_list)
+
+            if use_pca:
+                device = X.device
+                dtype = X.dtype
+                X_np = X.detach().cpu().float().numpy()
+                if X_np.shape[1] > 0:
+                    n_components = min(4, X_np.shape[0], X_np.shape[1])
+                    pca = PCA(n_components=n_components)
+                    X_pca_np = pca.fit_transform(X_np)
+                    X_pca = torch.tensor(X_pca_np, dtype=dtype)
+                else:
+                    X_pca = X.detach().cpu().float()
+                num_points = X_pca.shape[0]
+                curvatures = torch.ones(num_points) * float(1e8)
+                for i in range(2, num_points - 2):
+                    p0 = X_pca[i-2]  # shape (D,)
+                    p1 = X_pca[i-1]
+                    p2 = X_pca[i]
+                    p3 = X_pca[i+1]
+                    p4 = X_pca[i+2]
+                    dp  = (-p4 + 8*p3 - 8*p1 + p0) / 12.0       # O(h^4)
+                    ddp = (-p4 + 16*p3 - 30*p2 + 16*p1 - p0) / 12.0  # O(h^4)
+                    dp_norm_sq  = (dp * dp).sum()
+                    ddp_norm_sq = (ddp * ddp).sum()
+                    dot         = (dp * ddp).sum()
+                    denom = dp_norm_sq ** 1.5
+                    if denom > 1e-8:
+                        numerator = torch.sqrt(torch.clamp(dp_norm_sq * ddp_norm_sq - dot**2, min=0.0))
+                        curvatures[i] = numerator / denom
+            
+            else:
+                N = X.shape[0]
+                curvatures = torch.ones(N, device=X.device, dtype=X.dtype) * float(1e8)
+                p0 = X[:-4]   # i-2
+                p1 = X[1:-3]  # i-1
+                p2 = X[2:-2]  # i
+                p3 = X[3:-1]  # i+1
+                p4 = X[4:]    # i+2
+                dp  = (-p4 + 8*p3 - 8*p1 + p0) / 12.0
+                ddp = (-p4 + 16*p3 - 30*p2 + 16*p1 - p0) / 12.0
+                dp_norm_sq  = (dp * dp).sum(dim=-1)
+                ddp_norm_sq = (ddp * ddp).sum(dim=-1)
+                dot         = (dp * ddp).sum(dim=-1)
+                numerator   = torch.sqrt(torch.clamp(dp_norm_sq * ddp_norm_sq - dot**2, min=0.0))
+                denominator = dp_norm_sq ** 1.5 + 1e-8
+                curvatures[2:-2] = numerator / denominator
+            
+            sorted_indices = torch.argsort(curvatures)
+            skip_blocks_list = sorted_indices[:skip_blocks_num].tolist()
+            time_end = time.perf_counter()
+            logger.info(f"skip_blocks_list: {skip_blocks_list}, time: {time_end - time_start}")
+            
+        else:
+            skip_blocks_list = []
+
+        for layer_idx in range(self.num_layers):
+            if layer_idx in skip_blocks_list:
+                x = x + self.block_residual_cache[layer_idx]
+                self.block_output_cache[layer_idx] = x.clone().float().detach()
+                continue
+
+            orig_x = x.clone().detach()
+            block = expert.blocks[layer_idx]
+            # Action query/key/value are still step-dependent and must be recomputed each step.
+            (
+                q_action,
+                k_action,
+                v_action,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=action_freqs,
+                t_mod=action_t_mod,
+            )
+            layer_cache = video_kv_cache[layer_idx]
+            if "k" not in layer_cache or "v" not in layer_cache:
+                raise ValueError(
+                    f"`video_kv_cache[{layer_idx}]` must contain `k` and `v`."
+                )
+
+            k_video = layer_cache["k"]
+            v_video = layer_cache["v"]
+            if k_video.shape[1] != video_seq_len or v_video.shape[1] != video_seq_len:
+                raise ValueError(
+                    f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."
+                )
+
+            # Mixed attention: action queries attend to cached video K/V plus current action K/V.
+            k_cat = torch.cat([k_video, k_action], dim=1)
+            v_cat = torch.cat([v_video, v_action], dim=1)
+            mixed = self._mixed_attention(
+                q_cat=q_action,
+                k_cat=k_cat,
+                v_cat=v_cat,
+                attention_mask=action_attention_mask,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                mixed_slice=mixed,
+                context_payload=action_context_payload,
+            )
+
+            self.block_residual_cache[layer_idx] = x - orig_x
+            self.block_output_cache[layer_idx] = x.clone().float().detach()
 
         return x

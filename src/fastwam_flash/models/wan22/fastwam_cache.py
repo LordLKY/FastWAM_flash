@@ -23,6 +23,7 @@ infer_action_mapping = {
     'blockcache': 'infer_action_with_blockcache',
     'speccache': 'infer_action_with_speccache',
     'branchcache': 'infer_action_with_branchcache',
+    'parablock': 'infer_action_with_parablock',
 }
 
 class FastWAMCache(FastWAM):
@@ -79,6 +80,7 @@ class FastWAMCache(FastWAM):
             "blockcache",
             "speccache",
             "branchcache",
+            "parablock",
         ], f"Error: unsupported cache type {cache_type}"
         self.cache_type = cache_type
         self.infer_action = getattr(self, infer_action_mapping[cache_type])
@@ -217,6 +219,12 @@ class FastWAMCache(FastWAM):
             self.branchcache_config = dit_cache_config["branchcache_config"]
             self.branch_steps_list = self.branchcache_config['branch_steps_list']
             self.branch_merge_policy = self.branchcache_config['branch_merge_policy'] if "branch_merge_policy" in self.branchcache_config else "last"
+        
+        # for parablock
+        if self.cache_type == "parablock":
+            assert "parablock_config" in dit_cache_config, "parablock_config is required for parablock cache"
+            self.parablock_config = dit_cache_config["parablock_config"]
+            self.recompute_threshold = self.parablock_config['recompute_threshold']
     
     def reset_episode(self):
         if hasattr(self, "reference_action"):
@@ -360,15 +368,27 @@ class FastWAMCache(FastWAM):
                 step_with_cache += 1
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-                pred_action_posi = self._predict_action_noise_with_cache(
-                    latents_action=latents_action,
-                    timestep_action=timestep_action,
-                    context=context,
-                    context_mask=context_mask,
-                    video_kv_cache=video_kv_cache,
-                    attention_mask=attention_mask,
-                    video_seq_len=video_seq_len,
-                )
+                if not self.naivecache_config["add_blockcurvecache"]:
+                    pred_action_posi = self._predict_action_noise_with_cache(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                    )
+                else:
+                    pred_action_posi = self._predict_action_noise_with_cache_and_blockcurvecache(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                        enable_blockcache=step_idx != 0 and step_idx != num_inference_steps -1,
+                    )
                 pred_action = pred_action_posi
                 prev_pred = pred_action.clone().detach()
             else:
@@ -960,6 +980,39 @@ class FastWAMCache(FastWAM):
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
     
+    @torch.no_grad()
+    def _predict_action_noise_with_cache_and_blockcurvecache(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        enable_blockcache: bool = False,
+    ) -> torch.Tensor:
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        action_tokens = self.mot.forward_action_with_video_cache_and_blockcurvecache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+            enable_blockcache=enable_blockcache
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
+    
     # for SpecCache
     @torch.no_grad()
     def infer_action_with_speccache(
@@ -1312,42 +1365,130 @@ class FastWAMCache(FastWAM):
             shift_override=sigma_shift,
         )
 
-        branch_latents_actions = []
-        final_latents_action = latents_action.clone().detach()
-        for branch_steps in self.branch_steps_list:
-            current_latents_action = latents_action.clone().detach()
-            latents_action_records = []
-            prev_pred = None
+        if self.branch_merge_policy == 'batchstep':
+            # check branch_steps_list:
+            for branch_steps in self.branch_steps_list:
+                if not isinstance(branch_steps, list):
+                    raise ValueError(f"Each element in branch_steps_list must be a list, got {type(branch_steps)}")
+                if not branch_steps or branch_steps[0] != 0 or len(branch_steps) != 2:
+                    raise ValueError(f"Each branch_steps must be [0, x], got {branch_steps}")
+                x = branch_steps[-1]
+                if not isinstance(x, int) or not (1 <= x <= num_inference_steps - 1):
+                    raise ValueError(f"The last element x in branch_steps must be an integer between 1 and {num_inference_steps - 1}, got {x}")
+            # Sort by x (last element) in ascending order
+            self.branch_steps_list.sort(key=lambda bs: bs[-1])
 
-            num_step = 0
-            for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
-                if num_step in branch_steps or prev_pred is None:
-                    timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+            num_batch = len(self.branch_steps_list)
+            if context is not None:
+                batch_context = context.expand(num_batch, *context.shape[1:])
+            if context_mask is not None:
+                batch_context_mask = context_mask.expand(num_batch, *context_mask.shape[1:])
+            batch_step_idx = [0 for _ in range(num_batch)]
+            batch_latents_action = [latents_action.clone() for _ in range(num_batch)]
+            batch_prev_pred = [None for _ in range(num_batch)]
 
-                    pred_action_posi = self._predict_action_noise_with_cache(
-                        latents_action=current_latents_action,
-                        timestep_action=timestep_action,
-                        context=context,
-                        context_mask=context_mask,
-                        video_kv_cache=video_kv_cache,
-                        attention_mask=attention_mask,
-                        video_seq_len=video_seq_len,
+            # stage 1 (puiblic step 0):
+            pred_action_posi = self._predict_action_noise_with_cache(
+                latents_action=torch.cat(batch_latents_action, dim=0),
+                timestep_action=torch.cat(
+                    [infer_timesteps_action[i].unsqueeze(0).to(dtype=latents_action.dtype, device=self.device) for i in batch_step_idx],
+                    dim=0
+                ),
+                context=batch_context,
+                context_mask=batch_context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+            for i in range(num_batch):
+                batch_pred_action_i = pred_action_posi.chunk(num_batch, dim=0)[i]
+                batch_prev_pred[i] = batch_pred_action_i.clone()
+                batch_latents_action[i] = self.infer_action_scheduler.step(
+                    batch_pred_action_i,
+                    infer_deltas_action[batch_step_idx[i]],
+                    batch_latents_action[i]
+                )
+                batch_step_idx[i] += 1
+
+            # stage 2 (sync before next step):
+            for i in range(num_batch):
+                while batch_step_idx[i] < self.branch_steps_list[i][1]:
+                    batch_latents_action[i] = self.infer_action_scheduler.step(
+                        batch_prev_pred[i],
+                        infer_deltas_action[batch_step_idx[i]],
+                        batch_latents_action[i]
                     )
-                    pred_action = pred_action_posi
-                    prev_pred = pred_action.clone().detach()
-                else:
-                    pred_action = prev_pred
-                
-                current_latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, current_latents_action)
-                latents_action_records.append(current_latents_action[0].clone().detach().to(device="cpu", dtype=torch.float32))
-                num_step += 1
-            final_latents_action = current_latents_action
-            branch_latents_actions.append(latents_action_records)
+                    batch_step_idx[i] += 1
+            
+            # stage 3 (next public step):
+            pred_action_posi = self._predict_action_noise_with_cache(
+                latents_action=torch.cat(batch_latents_action, dim=0),
+                timestep_action=torch.cat(
+                    [infer_timesteps_action[i].unsqueeze(0).to(dtype=latents_action.dtype, device=self.device) for i in batch_step_idx],
+                    dim=0
+                ),
+                context=batch_context,
+                context_mask=batch_context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+            batch_final_pred = {i: pred_action_posi.chunk(num_batch, dim=0)[i] for i in range(num_batch)}
+
+            # stage 4 (finish remaining steps of the first branch):
+            current_pred = batch_prev_pred[0]
+            while batch_step_idx[0] < num_inference_steps:
+                if batch_step_idx[0] in batch_final_pred.keys():
+                    current_pred = batch_final_pred[batch_step_idx[0]]
+                batch_latents_action[0] = self.infer_action_scheduler.step(
+                    current_pred,
+                    infer_deltas_action[batch_step_idx[0]],
+                    batch_latents_action[0]
+                )
+                batch_step_idx[0] += 1
+
+        else:
+            branch_latents_actions = []
+            final_branch_latents_actions = []
+            final_latents_action = latents_action.clone().detach()
+            for branch_steps in self.branch_steps_list:
+                current_latents_action = latents_action.clone().detach()
+                latents_action_records = []
+                prev_pred = None
+
+                num_step = 0
+                for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+                    if num_step in branch_steps or prev_pred is None:
+                        timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+
+                        pred_action_posi = self._predict_action_noise_with_cache(
+                            latents_action=current_latents_action,
+                            timestep_action=timestep_action,
+                            context=context,
+                            context_mask=context_mask,
+                            video_kv_cache=video_kv_cache,
+                            attention_mask=attention_mask,
+                            video_seq_len=video_seq_len,
+                        )
+                        pred_action = pred_action_posi
+                        prev_pred = pred_action.clone().detach()
+                    else:
+                        pred_action = prev_pred
+                    
+                    current_latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, current_latents_action)
+                    latents_action_records.append(current_latents_action[0].clone().detach().to(device="cpu", dtype=torch.float32))
+                    num_step += 1
+                final_latents_action = current_latents_action
+                final_branch_latents_actions.append(final_latents_action)
+                branch_latents_actions.append(latents_action_records)
         
         if self.branch_merge_policy == 'last':
             output_action = final_latents_action[0].detach().to(device="cpu", dtype=torch.float32)
         elif self.branch_merge_policy == 'mean':
-            output_action = torch.stack(branch_latents_actions, dim=0).mean(dim=0)[0].detach().to(device="cpu", dtype=torch.float32)
+            output_action = torch.stack(final_branch_latents_actions, dim=0).mean(dim=0)[0].detach().to(device="cpu", dtype=torch.float32)
+        elif self.branch_merge_policy == 'batchstep':
+            output_action = batch_latents_action[0][0].detach().to(device="cpu", dtype=torch.float32)
+            branch_latents_actions = None
         else:
             raise ValueError(f"Unknown branch_merge_policy: {self.branch_merge_policy}")
 
@@ -1355,3 +1496,190 @@ class FastWAMCache(FastWAM):
             "action": output_action,
             "branch_latents_action": branch_latents_actions,
         }
+    
+    # for ParaBlock
+    @torch.no_grad()
+    def infer_action_with_parablock(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
+            )
+
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+            )
+        _, _, height, width = input_image.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
+            )
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim == 2 and proprio.shape[0] == 1:
+                pass
+            else:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (1, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be both provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context_mask.ndim != 2:
+                raise ValueError(
+                    f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+                )
+            context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if proprio is not None:
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=latents_action.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+
+        step_idx = 0
+
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+
+            pred_action_posi = self._predict_action_noise_with_cache_and_parablock(
+                latents_action=latents_action,
+                timestep_action=timestep_action,
+                context=context,
+                context_mask=context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+                recompute_threshold=self.recompute_threshold,
+            )
+            pred_action = pred_action_posi
+
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            step_idx += 1
+
+        return {
+            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+        }
+    
+    @torch.no_grad()
+    def _predict_action_noise_with_cache_and_parablock(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        recompute_threshold: float = 0.25,
+    ) -> torch.Tensor:
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        action_tokens, cal_layer_num = self.mot.forward_action_with_video_cache_and_parablock(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+            recompute_threshold=recompute_threshold,
+        )
+
+        logger.info(f"cal_layer_num: {cal_layer_num}")
+
+        return self.action_expert.post_dit(action_tokens, action_pre)
