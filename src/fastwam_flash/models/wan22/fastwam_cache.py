@@ -368,17 +368,7 @@ class FastWAMCache(FastWAM):
                 step_with_cache += 1
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-                if not self.naivecache_config["add_blockcurvecache"]:
-                    pred_action_posi = self._predict_action_noise_with_cache(
-                        latents_action=latents_action,
-                        timestep_action=timestep_action,
-                        context=context,
-                        context_mask=context_mask,
-                        video_kv_cache=video_kv_cache,
-                        attention_mask=attention_mask,
-                        video_seq_len=video_seq_len,
-                    )
-                else:
+                if "add_blockcurvecache" in self.naivecache_config and self.naivecache_config["add_blockcurvecache"]:
                     pred_action_posi = self._predict_action_noise_with_cache_and_blockcurvecache(
                         latents_action=latents_action,
                         timestep_action=timestep_action,
@@ -389,6 +379,31 @@ class FastWAMCache(FastWAM):
                         video_seq_len=video_seq_len,
                         enable_blockcache=step_idx != 0 and step_idx != num_inference_steps -1,
                     )
+                    logger.info("NOTE: using blockcurvecache")
+                if "add_blockcache" in self.naivecache_config and self.naivecache_config["add_blockcache"]:
+                    pred_action_posi = self._predict_action_noise_with_cache_and_blockcache(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                        blockcache_ratio=0.6,
+                        enable_blockcache=step_idx != 0 and step_idx != num_inference_steps -1,
+                    )
+                    logger.info("NOTE: using blockcache")
+                else:
+                    pred_action_posi = self._predict_action_noise_with_cache(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                    )
+                    
                 pred_action = pred_action_posi
                 prev_pred = pred_action.clone().detach()
             else:
@@ -935,6 +950,7 @@ class FastWAMCache(FastWAM):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                blockcache_ratio=self.blockcache_config["ratio"],
                 enable_blockcache=step_idx % self.blockcache_config["interval"] != 0,
             )
             pred_action = pred_action_posi
@@ -956,6 +972,7 @@ class FastWAMCache(FastWAM):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        blockcache_ratio: float,
         enable_blockcache: bool = False,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
@@ -976,7 +993,7 @@ class FastWAMCache(FastWAM):
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
             enable_blockcache=enable_blockcache,
-            blockcache_ratio=self.blockcache_config["ratio"],
+            blockcache_ratio=blockcache_ratio,
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
     
