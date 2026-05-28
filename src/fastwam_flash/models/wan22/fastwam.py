@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+import numpy as np
 
 from fastwam_flash.utils.logging_config import get_logger
 
@@ -701,6 +702,7 @@ class FastWAM(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        collect_attn: bool = False,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -708,7 +710,7 @@ class FastWAM(torch.nn.Module):
             context=context,
             context_mask=context_mask,
         )
-        action_tokens = self.mot.forward_action_with_video_cache(
+        action_tokens, extra_mot_outputs = self.mot.forward_action_with_video_cache(
             action_tokens=action_pre["tokens"],
             action_freqs=action_pre["freqs"],
             action_t_mod=action_pre["t_mod"],
@@ -719,8 +721,108 @@ class FastWAM(torch.nn.Module):
             video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
+            collect_attn=collect_attn,
         )
-        return self.action_expert.post_dit(action_tokens, action_pre)
+        pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+
+        # Pack non-critical outputs into a dictionary
+        extra_outputs = {}
+        if collect_attn:
+            extra_outputs["attention_scores"] = extra_mot_outputs['attention_scores']
+
+        return pred_action, extra_outputs
+    
+    def _attention_to_limits(
+        self,
+        attention_scores,
+        layers,
+        video_seq_len 
+    ) -> int:
+        """
+        Calculate the longest prefix of key tokens that fall within the fitted line region.
+        
+        Args:
+            attention_scores: Dictionary of attention scores, keyed by layer name.
+            layers: List of layer indices to use.
+            video_seq_len: Length of video tokens.
+        
+        Returns:
+            int: Length of the longest prefix where all tokens fall within the fitted region.
+        """
+        if video_seq_len is None or video_seq_len <= 0:
+            return 0
+        
+        # Collect attention maps from specified layers and average across heads
+        layer_attn_list = []
+        for layer_idx in layers:
+            layer_key = f"layer_{layer_idx}"
+            if layer_key not in attention_scores:
+                continue
+            
+            attn_probs = attention_scores[layer_key]
+            attn_mean = attn_probs[0].detach().float().mean(dim=0)
+            layer_attn_list.append(attn_mean)
+        if not layer_attn_list:
+            return 0
+
+        avg_attn = torch.stack(layer_attn_list).mean(dim=0)
+        T, S = avg_attn.shape
+        video_seq_len = min(video_seq_len, S)
+        video_attn = avg_attn[:, :video_seq_len]  # (T, video_seq_len)
+
+        if video_attn.shape[1] > 2:
+            X = video_attn - video_attn.mean(dim=0)
+            U, S_pca, V = torch.pca_lowrank(X, q=2, niter=2)
+            pca_result = (X @ V).detach().cpu().numpy()
+        else:
+            pca_result = video_attn.detach().cpu().numpy()
+        
+        num_points = min(10, pca_result.shape[0])
+        if num_points < 2:
+            return num_points
+        
+        # Use first 10 points to fit line
+        first_10 = pca_result[:num_points]
+
+        corr_coef = np.corrcoef(first_10[:, 0], first_10[:, 1])[0, 1]
+        if abs(corr_coef) < 0.85:
+            return 10
+        
+        # Linear fit using least squares
+        coeffs = np.polyfit(first_10[:, 0], first_10[:, 1], deg=1)
+        slope = coeffs[0]
+        intercept = coeffs[1]
+        
+        # Calculate distances from first 10 points to line
+        a = slope
+        b = -1
+        c = intercept
+        distances = np.abs(a * first_10[:, 0] + b * first_10[:, 1] + c) / np.sqrt(a**2 + b**2)
+        d_max = np.max(distances)
+        d1 = 1.5 * d_max
+        
+        # Calculate the perpendicular offset in y direction
+        perp_offset = d1 * np.sqrt(slope**2 + 1)
+        
+        # Find the longest prefix where all points are within the region
+        prefix_length = 10
+        total_points = pca_result.shape[0]
+        
+        for i in range(10, total_points):
+            x = pca_result[i, 0]
+            y = pca_result[i, 1]
+            
+            # Calculate expected y on the line
+            y_line = slope * x + intercept
+            
+            # Check if point is within the region
+            if abs(y - y_line) <= perp_offset:
+                prefix_length = i + 1
+            else:
+                # Stop at first point outside the region
+                break
+        
+        return prefix_length
 
     @torch.no_grad()
     def infer_joint(
@@ -918,6 +1020,7 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        enable_action_limits: bool = False
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -1027,10 +1130,15 @@ class FastWAM(torch.nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
+
+        num_step = 0
+        attention_scores = None
+
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_action_posi = self._predict_action_noise_with_cache(
+            collect_attn = enable_action_limits and num_step == 0
+            pred_action_posi, extra_outputs = self._predict_action_noise_with_cache(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
                 context=context,
@@ -1038,13 +1146,27 @@ class FastWAM(torch.nn.Module):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                collect_attn=collect_attn,
             )
             pred_action = pred_action_posi
 
+            if collect_attn and attention_scores is None:
+                attention_scores = extra_outputs["attention_scores"]
+
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+        
+        action_limits = None
+        if enable_action_limits:
+            assert attention_scores is not None, "Attention scores are required for computing action limits."
+            action_limits = self._attention_to_limits(
+                attention_scores=attention_scores,
+                layers=[10, 11, 12, 13, 14, 15, 16],
+                video_seq_len=video_seq_len,
+            )
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action_limits": action_limits,
         }
 
     @torch.no_grad()
