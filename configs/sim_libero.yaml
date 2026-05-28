@@ -35,11 +35,13 @@ EVALUATION:
   negative_prompt: ""
   rand_device: cpu
   tiled: false
+  adaptive_horizon: false
 
   record_actions: false
   absolute_actions: false
   record_actions_bias: false
   record_fixed_actions: false
+  record_videos: true
 
   # Optional external inputs
   dataset_stats_path: null

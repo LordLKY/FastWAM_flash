@@ -420,6 +420,7 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+
     if model.cache_type == 'speccache':
         infer_kwargs["accept_signal"] = accept_signal
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
@@ -428,6 +429,8 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
+    if bool(cfg.EVALUATION.get("adaptive_horizon", False)):
+        infer_kwargs["enable_action_limits"] = True
 
     with torch.no_grad():
         if visualize_future_video:
@@ -438,6 +441,7 @@ def _predict_action_chunk(
     action = pred["action"]  # [T, D]
     draft_action = pred.get("draft_action", None)
     orig_action = pred.get("orig_action", None)
+    action_limits = pred.get("action_limits", None)
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -462,7 +466,12 @@ def _predict_action_chunk(
         if bool(cfg.EVALUATION.get("binarize_gripper", False)):
             orig_action[..., -1] = np.sign(orig_action[..., -1])
     
-    action_pkg = {"action": action, "draft_action": draft_action, "orig_action": orig_action}
+    action_pkg = {
+        "action": action,
+        "action_limits": action_limits,
+        "draft_action": draft_action,
+        "orig_action": orig_action
+    }
 
     return action_pkg, imgs, predicted_future_frames
 
@@ -659,6 +668,8 @@ def run_single_episode(
     prev_extra_actions = []
     fixed_actions = {}
 
+    adaptive_horizon = bool(cfg.EVALUATION.get("adaptive_horizon", False))
+
     use_speccache = model.cache_type == "speccache"
     accept_signal = None
     if use_speccache:
@@ -717,6 +728,12 @@ def run_single_episode(
             else:
                 current_predicted_future_clip = None
             current_replan_step = 0
+
+            if adaptive_horizon:
+                action_limits = action_pkg["action_limits"]
+                if action_limits is not None:
+                    replan_steps = action_limits
+
             if use_action_ensembler:
                 ensembler.add_actions(action_chunk, t)
                 pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
@@ -743,6 +760,9 @@ def run_single_episode(
                     )
                     prev_extra_actions = action_chunk[replan_steps:2 * replan_steps].tolist()
             replay_images.append(imgs.copy())
+
+            if adaptive_horizon:
+                logging.info(f"current replan_steps: {replan_steps}")
 
             # if len(fix_actions) > 0:
             #     pending_actions = fix_actions + pending_actions
@@ -925,6 +945,9 @@ def run_single_task(
     action_records, draft_action_records, orig_action_records = {}, {}, {}
     action_bias_records = {}
 
+    # record videos (optional)
+    record_videos = bool(cfg.EVALUATION.get("record_videos", False))
+
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
         success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_array_pkg, action_bias_array = run_single_episode(
             env=env,
@@ -947,13 +970,14 @@ def run_single_task(
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
-        save_rollout_video(
-            video_dir,
-            replay_images,
-            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-            success=success,
-            task_description=task_description,
-        )
+        if record_videos:
+            save_rollout_video(
+                video_dir,
+                replay_images,
+                f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                success=success,
+                task_description=task_description,
+            )
         if visualize_future_video:
             if len(predicted_future_video_clips) == 0:
                 logging.warning(
