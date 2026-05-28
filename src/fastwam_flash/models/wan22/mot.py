@@ -77,20 +77,21 @@ class MoT(nn.Module):
                 gate_mlp.squeeze(2),
             )
         return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-
+    
     def _mixed_attention(
         self,
         q_cat: torch.Tensor,
         k_cat: torch.Tensor,
         v_cat: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        return_attention: bool = False,
+    ) -> torch.Tensor or tuple[torch.Tensor, torch.Tensor]:
         attn_mask = attention_mask.to(device=q_cat.device)
 
-        def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask)
+        def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_attn: bool = False) -> torch.Tensor or tuple[torch.Tensor, torch.Tensor]:
+            return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask, return_attention=return_attn)
 
-        if self.mot_checkpoint_mixed_attn and self.training:
+        if self.mot_checkpoint_mixed_attn and self.training and not return_attention:
             return torch.utils.checkpoint.checkpoint(
                 _forward,
                 q_cat,
@@ -98,7 +99,7 @@ class MoT(nn.Module):
                 v_cat,
                 use_reentrant=False,
             )
-        return _forward(q_cat, k_cat, v_cat)
+        return _forward(q_cat, k_cat, v_cat, return_attn=return_attention)
 
     @staticmethod
     def _apply_expert_post_block(
@@ -353,7 +354,8 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
-    ) -> torch.Tensor:
+        collect_attn: bool = False,
+    ):  # -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
         Args:
@@ -393,6 +395,7 @@ class MoT(nn.Module):
 
         expert = self.mixtures["action"]
         x = action_tokens
+        attention_scores = {} if collect_attn else None
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
             # Action query/key/value are still step-dependent and must be recomputed each step.
@@ -433,12 +436,22 @@ class MoT(nn.Module):
             # Mixed attention: action queries attend to cached video K/V plus current action K/V.
             k_cat = torch.cat([k_video, k_action], dim=1)
             v_cat = torch.cat([v_video, v_action], dim=1)
-            mixed = self._mixed_attention(
-                q_cat=q_action,
-                k_cat=k_cat,
-                v_cat=v_cat,
-                attention_mask=action_attention_mask,
-            )
+            if collect_attn:
+                mixed, attn_probs = self._mixed_attention(
+                    q_cat=q_action,
+                    k_cat=k_cat,
+                    v_cat=v_cat,
+                    attention_mask=action_attention_mask,
+                    return_attention=True,
+                )
+                attention_scores[f"layer_{layer_idx}"] = attn_probs
+            else:
+                mixed = self._mixed_attention(
+                    q_cat=q_action,
+                    k_cat=k_cat,
+                    v_cat=v_cat,
+                    attention_mask=action_attention_mask,
+                )
             x = self._apply_post_with_optional_checkpoint(
                 block=block,
                 residual_x=residual_x,
@@ -450,7 +463,12 @@ class MoT(nn.Module):
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
             )
-        return x
+
+        extra_outputs = {}
+        if collect_attn:
+            extra_outputs["attention_scores"] = attention_scores
+
+        return x, extra_outputs
 
     def forward(
         self,

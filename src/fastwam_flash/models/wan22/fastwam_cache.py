@@ -246,6 +246,7 @@ class FastWAMCache(FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        enable_action_limits: bool = False,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -360,6 +361,7 @@ class FastWAMCache(FastWAM):
         step_without_cache = 0
         step_with_cache = 0
         prev_pred = None
+        attention_scores = None
 
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             step_without_cache += 1
@@ -368,17 +370,9 @@ class FastWAMCache(FastWAM):
                 step_with_cache += 1
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-                if not self.naivecache_config["add_blockcurvecache"]:
-                    pred_action_posi = self._predict_action_noise_with_cache(
-                        latents_action=latents_action,
-                        timestep_action=timestep_action,
-                        context=context,
-                        context_mask=context_mask,
-                        video_kv_cache=video_kv_cache,
-                        attention_mask=attention_mask,
-                        video_seq_len=video_seq_len,
-                    )
-                else:
+                collect_attn = enable_action_limits and step_idx == 0
+
+                if "add_blockcurvecache" in self.naivecache_config and self.naivecache_config["add_blockcurvecache"]:
                     pred_action_posi = self._predict_action_noise_with_cache_and_blockcurvecache(
                         latents_action=latents_action,
                         timestep_action=timestep_action,
@@ -389,6 +383,35 @@ class FastWAMCache(FastWAM):
                         video_seq_len=video_seq_len,
                         enable_blockcache=step_idx != 0 and step_idx != num_inference_steps -1,
                     )
+                    logger.info("NOTE: using blockcurvecache")
+                if "add_blockcache" in self.naivecache_config and self.naivecache_config["add_blockcache"]:
+                    pred_action_posi = self._predict_action_noise_with_cache_and_blockcache(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                        blockcache_ratio=0.6,
+                        enable_blockcache=step_idx != 0 and step_idx != num_inference_steps -1,
+                    )
+                    logger.info("NOTE: using blockcache")
+                else:
+                    pred_action_posi, extra_outputs = self._predict_action_noise_with_cache(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                        collect_attn=collect_attn,
+                    )
+                
+                if collect_attn and attention_scores is None:
+                    attention_scores = extra_outputs["attention_scores"]
+                    
                 pred_action = pred_action_posi
                 prev_pred = pred_action.clone().detach()
             else:
@@ -399,8 +422,18 @@ class FastWAMCache(FastWAM):
         
         logger.info(f"runned {step_with_cache}/{step_without_cache} steps")
 
+        action_limits = None
+        if enable_action_limits:
+            assert attention_scores is not None, "Attention scores are required for computing action limits."
+            action_limits = self._attention_to_limits(
+                attention_scores=attention_scores,
+                layers=[10, 11, 12, 13, 14, 15, 16],
+                video_seq_len=video_seq_len,
+            )
+
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action_limits": action_limits,
         }
     
     # for TeaCache
@@ -935,6 +968,7 @@ class FastWAMCache(FastWAM):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                blockcache_ratio=self.blockcache_config["ratio"],
                 enable_blockcache=step_idx % self.blockcache_config["interval"] != 0,
             )
             pred_action = pred_action_posi
@@ -956,6 +990,7 @@ class FastWAMCache(FastWAM):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        blockcache_ratio: float,
         enable_blockcache: bool = False,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
@@ -976,7 +1011,7 @@ class FastWAMCache(FastWAM):
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
             enable_blockcache=enable_blockcache,
-            blockcache_ratio=self.blockcache_config["ratio"],
+            blockcache_ratio=blockcache_ratio,
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
     

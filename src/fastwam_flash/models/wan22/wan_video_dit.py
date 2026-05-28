@@ -11,17 +11,41 @@ from fastwam_flash.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
     
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
+# def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
+#     if compatibility_mode:
+#         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+#         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+#         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+#         x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
+#         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+#         return x
+#     else:
+#         raise NotImplementedError("Only compatibility mode is implemented for flash attention. Please set compatibility_mode=True.")
+
+
+def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True, return_attention=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-        return x
+        if return_attention:
+            # Manually compute attention to get attention scores
+            d_k = q.size(-1)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+            if ctx_mask is not None:
+                if ctx_mask.dim() == 2:
+                    ctx_mask = ctx_mask.unsqueeze(0).unsqueeze(0)
+                attn_scores = attn_scores.masked_fill(~ctx_mask, float('-inf'))
+            attn_probs = F.softmax(attn_scores, dim=-1)
+            x = torch.matmul(attn_probs, v)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+            return x, attn_probs
+        else:
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+            return x
     else:
         raise NotImplementedError("Only compatibility mode is implemented for flash attention. Please set compatibility_mode=True.")
-
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
